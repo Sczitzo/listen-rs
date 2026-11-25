@@ -389,67 +389,136 @@ fn render_vocabulary_card(
             actions.push(UiAction::UpdateVocab(vocab_buf.clone()));
         }
 
-        ui.add_space(4.0);
         let term_count = vocab_buf
             .split([',', '\n'])
             .filter(|w| !w.trim().is_empty())
             .count();
-        let count_note = match term_count {
-            0 => "No terms yet.".to_owned(),
-            1 => "1 term · saved automatically".to_owned(),
-            n => format!("{n} terms · saved automatically"),
-        };
-        ui.label(RichText::new(count_note).size(12.0).color(p.faint));
+        if term_count > 0 {
+            ui.add_space(4.0);
+            let count_note = match term_count {
+                1 => "1 term · saved automatically".to_owned(),
+                n => format!("{n} terms · saved automatically"),
+            };
+            ui.label(RichText::new(count_note).size(12.0).color(p.faint));
+        }
 
         if !view.vocab_suggestions.is_empty() {
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                ui.label(
-                    RichText::new("Seen often, not in your vocabulary:")
-                        .size(12.0)
-                        .color(p.muted),
-                );
-                for word in view.vocab_suggestions {
-                    Frame::default()
-                        .fill(p.surface2)
-                        .stroke(Stroke::new(1.0_f32, p.line))
-                        .corner_radius(CornerRadius::same(99))
-                        .inner_margin(Margin::symmetric(9, 3))
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
-                            ui.label(RichText::new(word).size(12.5).color(p.fg));
-                            if ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new("+").size(13.0).strong().color(p.accent),
-                                    )
-                                    .sense(Sense::click()),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text("Add to vocabulary")
-                                .clicked()
-                            {
-                                actions.push(UiAction::AcceptVocabSuggestion(word.clone()));
-                            }
-                            if ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new("×").size(13.0).color(p.muted),
-                                    )
-                                    .sense(Sense::click()),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text("Dismiss suggestion")
-                                .clicked()
-                            {
-                                actions.push(UiAction::DismissVocabSuggestion(word.clone()));
-                            }
-                        });
-                }
-            });
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Seen often, not in your vocabulary:")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            ui.add_space(6.0);
+            render_vocab_chips(ui, p, view.vocab_suggestions, actions);
         }
     });
+}
+
+/// Renders atomic, non-breaking suggestion pills wrapped cleanly into explicit horizontal rows.
+fn render_vocab_chips(
+    ui: &mut Ui,
+    p: &Palette,
+    words: &[String],
+    actions: &mut Vec<UiAction>,
+) {
+    let avail_w = ui.available_width().max(120.0);
+    let gap_x = 6.0_f32;
+    let gap_y = 6.0_f32;
+    let chip_h = 26.0_f32;
+    let font = FontId::proportional(12.5);
+    let btn_font = FontId::proportional(13.0);
+
+    // Measure every pill atomically first so no chip ever breaks mid-word or overflows the card
+    let measured: Vec<(&String, f32, f32)> = words
+        .iter()
+        .map(|w| {
+            let tw = ui.fonts(|f| f.layout_no_wrap(w.clone(), font.clone(), p.fg).size().x);
+            let chip_w = (tw + 52.0).min(avail_w);
+            (w, tw, chip_w)
+        })
+        .collect();
+
+    let mut rows: Vec<Vec<(&String, f32, f32)>> = Vec::new();
+    let mut cur_row: Vec<(&String, f32, f32)> = Vec::new();
+    let mut cur_w = 0.0_f32;
+    for item in measured {
+        let needed = if cur_row.is_empty() { item.2 } else { gap_x + item.2 };
+        if !cur_row.is_empty() && cur_w + needed > avail_w {
+            rows.push(std::mem::take(&mut cur_row));
+            cur_w = 0.0;
+        }
+        cur_w += if cur_row.is_empty() { item.2 } else { gap_x + item.2 };
+        cur_row.push(item);
+    }
+    if !cur_row.is_empty() {
+        rows.push(cur_row);
+    }
+
+    for (r_idx, row) in rows.into_iter().enumerate() {
+        if r_idx > 0 {
+            ui.add_space(gap_y);
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap_x;
+            for (word, tw, chip_w) in row {
+                let (rect, _) = ui.allocate_exact_size(vec2(chip_w, chip_h), Sense::hover());
+                let add_rect = Rect::from_min_size(
+                    egui::pos2(rect.right() - 40.0, rect.top()),
+                    vec2(19.0, chip_h),
+                );
+                let dismiss_rect = Rect::from_min_size(
+                    egui::pos2(rect.right() - 21.0, rect.top()),
+                    vec2(19.0, chip_h),
+                );
+                let add_resp = ui
+                    .interact(add_rect, ui.make_persistent_id(("vocab_add", word)), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Add to vocabulary");
+                let dismiss_resp = ui
+                    .interact(dismiss_rect, ui.make_persistent_id(("vocab_no", word)), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Dismiss suggestion");
+
+                let hovered = add_resp.hovered() || dismiss_resp.hovered();
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::same(99),
+                    if hovered { blend(p.surface2, p.accent, 0.10) } else { p.surface2 },
+                );
+                painter.rect_stroke(
+                    rect,
+                    CornerRadius::same(99),
+                    Stroke::new(1.0_f32, if hovered { p.accent.gamma_multiply(0.75) } else { p.line }),
+                    StrokeKind::Inside,
+                );
+                // Word text
+                let text_x = rect.left() + 10.0;
+                let max_text_w = (chip_w - 50.0).max(20.0);
+                let galley = painter.layout_no_wrap(word.clone(), font.clone(), p.fg);
+                let _ = (tw, max_text_w);
+                painter.galley(
+                    egui::pos2(text_x, rect.center().y - galley.size().y * 0.5),
+                    galley,
+                    p.fg,
+                );
+                // '+' action
+                let plus_col = if add_resp.hovered() { p.fg } else { p.accent };
+                painter.text(add_rect.center(), Align2::CENTER_CENTER, "+", btn_font.clone(), plus_col);
+                // '×' action
+                let x_col = if dismiss_resp.hovered() { p.rec } else { p.muted };
+                painter.text(dismiss_rect.center(), Align2::CENTER_CENTER, "×", btn_font.clone(), x_col);
+
+                if add_resp.clicked() {
+                    actions.push(UiAction::AcceptVocabSuggestion(word.clone()));
+                }
+                if dismiss_resp.clicked() {
+                    actions.push(UiAction::DismissVocabSuggestion(word.clone()));
+                }
+            }
+        });
+    }
 }
 
 fn render_recent_card(

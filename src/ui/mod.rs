@@ -153,6 +153,11 @@ pub struct HistoryUiState {
     pub filter: String,
     pub grouping: HistoryGrouping,
     pub open_ids: HashSet<u64>,
+    pub collapsed_groups: HashSet<String>,
+    pub selected_group: Option<String>,
+    pub jump_target: Option<String>,
+    pub display_limit: usize,
+    pub last_filter: String,
     pub confirm_clear: bool,
 }
 

@@ -189,14 +189,18 @@ pub fn badge(ui: &mut Ui, p: &Palette, text: &str, tint: Option<Color32>) {
     let fg = tint.unwrap_or(p.muted);
     let fill = tint.map_or(p.surface2, |c| blend(p.surface, c, 0.16));
     let stroke = tint.map_or(p.line, |c| blend(p.line, c, 0.45));
-    Frame::default()
-        .fill(fill)
-        .stroke(Stroke::new(1.0_f32, stroke))
-        .corner_radius(CornerRadius::same(99))
-        .inner_margin(Margin::symmetric(9, 3))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.5).strong().color(fg));
-        });
+    let font = FontId::new(11.5, FontFamily::Name("semibold".into()));
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, fg));
+    let desired = vec2(galley.size().x + 18.0, (galley.size().y + 6.0).max(20.0));
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(99), fill);
+    painter.rect_stroke(rect, CornerRadius::same(99), Stroke::new(1.0_f32, stroke), StrokeKind::Inside);
+    painter.galley(
+        pos2(rect.left() + 9.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
 }
 
 /// Crisp On/Off pill switch matching Listen's Settings toggle design.
@@ -250,10 +254,13 @@ pub fn frame_titled(
     ui.add_space(6.0);
     let border = if focused { p.accent } else { p.line };
     let bg_idx = ui.painter().add(Shape::Noop);
+    let avail = ui.available_width();
     let inner = Frame::default()
         .inner_margin(Margin { left: 16, right: 16, top: 18, bottom: 14 })
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            let content_w = (avail - 32.0).max(120.0);
+            ui.set_width(content_w);
+            ui.set_max_width(content_w);
             add(ui);
         });
     let rect = inner.response.rect;
@@ -504,9 +511,9 @@ pub fn layout_tile(ui: &mut Ui, p: &Palette, layout: LayoutId, selected: bool, w
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Miniature trend sparkline rendered natively via `egui::Painter`.
+/// Miniature trend sparkline rendered natively via `egui::Painter` with hover tooltip.
 pub fn sparkline(ui: &mut Ui, p: &Palette, values: &[Option<f64>], size: Vec2) {
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let nums: Vec<(usize, f64)> = values.iter().enumerate().filter_map(|(i, v)| v.map(|x| (i, x))).collect();
     if nums.len() < 2 {
         return;
@@ -518,15 +525,31 @@ pub fn sparkline(ui: &mut Ui, p: &Palette, values: &[Option<f64>], size: Vec2) {
     let pts: Vec<Pos2> = nums
         .iter()
         .map(|(i, v)| {
-            let x = rect.left() + 2.0 + (*i as f32 / n) * (rect.width() - 4.0);
+            let x = rect.left() + 3.0 + (*i as f32 / n) * (rect.width() - 6.0);
             let norm = ((*v - min_v) / span) as f32;
             let y = rect.bottom() - 3.0 - norm * (rect.height() - 6.0);
             pos2(x, y)
         })
         .collect();
     ui.painter().add(Shape::line(pts.clone(), Stroke::new(1.6_f32, p.accent)));
-    if let Some(&last) = pts.last() {
-        ui.painter().circle_filled(last, 2.5, p.accent);
+    for (idx, &pt) in pts.iter().enumerate() {
+        let is_last = idx + 1 == pts.len();
+        ui.painter().circle_filled(pt, if is_last { 2.8 } else { 1.8 }, p.accent.gamma_multiply(if is_last { 1.0 } else { 0.65 }));
+    }
+    if resp.hovered() {
+        let labels = ["3 wks ago", "2 wks ago", "Last wk", "This wk"];
+        let summary: Vec<String> = nums
+            .iter()
+            .map(|(i, v)| {
+                let lbl = labels.get(*i).copied().unwrap_or("Period");
+                if (*v - v.round()).abs() < 0.05 {
+                    format!("{lbl}: {:.0}", v)
+                } else {
+                    format!("{lbl}: {:.1}", v)
+                }
+            })
+            .collect();
+        resp.on_hover_text(summary.join("  ·  "));
     }
 }
 

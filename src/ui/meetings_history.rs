@@ -6,12 +6,13 @@ use crate::theme::{blend, Palette};
 use crate::ui::widgets::{self, Icon};
 use crate::ui::{HistoryGrouping, HistoryUiState, MeetingUiState, UiAction, UiView};
 use eframe::egui::{
-    self, vec2, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Label, Layout,
-    Margin, Response, RichText, Sense, Stroke, TextEdit, Ui,
+    self, pos2, vec2, Align, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame,
+    Id, Label, Layout, Margin, Rect, Response, RichText, ScrollArea, Sense, Stroke, StrokeKind,
+    TextEdit, Ui,
 };
 use std::time::Duration;
 
-const MAX_RENDERED_HISTORY: usize = 200;
+const HISTORY_PAGE_SIZE: usize = 60;
 const LONG_ENTRY_CHAR_LIMIT: usize = 420;
 const LONG_ENTRY_PREVIEW_CHARS: usize = 380;
 
@@ -325,7 +326,7 @@ fn render_meeting_note_card(
     });
 }
 
-/// Render the History & 4-week stats screen.
+/// Render the History & 4-week stats screen with an interactive Jump-to timeline rail.
 pub fn render_history(
     ui: &mut Ui,
     p: &Palette,
@@ -338,9 +339,18 @@ pub fn render_history(
 
     // Tools row: search box on left, Group by segmented control on right
     ui.add_space(14.0);
+    let prev_grouping = state.grouping;
     render_history_tools_row(ui, p, state);
+    if state.display_limit == 0 || state.filter != state.last_filter || state.grouping != prev_grouping {
+        state.display_limit = HISTORY_PAGE_SIZE;
+        state.last_filter = state.filter.clone();
+        if state.grouping != prev_grouping {
+            state.selected_group = None;
+            state.jump_target = None;
+        }
+    }
 
-    // Filter history entries newest-first, capping rendered items cleanly to 200
+    // Filter history entries newest-first across ALL stored entries
     let query = state.filter.trim().to_ascii_lowercase();
     let matched: Vec<&HistoryEntry> = view
         .history
@@ -349,19 +359,6 @@ pub fn render_history(
         .filter(|entry| entry_matches_query(entry, &query))
         .collect();
     let total_matches = matched.len();
-    let visible = &matched[..total_matches.min(MAX_RENDERED_HISTORY)];
-
-    if total_matches > MAX_RENDERED_HISTORY {
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(format!(
-                "Showing latest {} of {} matches",
-                MAX_RENDERED_HISTORY, total_matches
-            ))
-            .size(12.0)
-            .color(p.faint),
-        );
-    }
 
     ui.add_space(12.0);
 
@@ -389,7 +386,7 @@ pub fn render_history(
                 ui.add_space(12.0);
             });
         });
-    } else if visible.is_empty() {
+    } else if matched.is_empty() {
         widgets::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.vertical_centered(|ui| {
@@ -403,37 +400,52 @@ pub fn render_history(
                 ui.add_space(6.0);
                 if widgets::secondary_btn(ui, p, "Clear search", true).clicked() {
                     state.filter.clear();
+                    state.display_limit = HISTORY_PAGE_SIZE;
                 }
                 ui.add_space(10.0);
             });
         });
     } else {
-        // Group entries preserving newest-first group order
-        let groups = group_entries(visible, state.grouping);
-        for (group_idx, (group_label, entries)) in groups.into_iter().enumerate() {
-            if group_idx > 0 {
-                ui.add_space(10.0);
-            }
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(group_label).size(12.5).strong().color(p.muted));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let n = entries.len();
-                    let count_str = if n == 1 {
-                        "1 dictation".to_owned()
-                    } else {
-                        format!("{n} dictations")
-                    };
-                    ui.label(RichText::new(count_str).size(11.5).color(p.faint));
+        // Group ALL matched entries first so the Jump-to timeline covers every single day/app
+        let groups = group_entries(&matched, state.grouping);
+        let mut group_starts: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut running = 0usize;
+        for (_, entries) in &groups {
+            group_starts.push(running);
+            running += entries.len();
+        }
+        if state.selected_group.as_deref().is_none_or(|sel| !groups.iter().any(|(k, _)| *k == sel)) {
+            state.selected_group = groups.first().map(|(k, _)| (*k).to_owned());
+        }
+
+        let avail_w = ui.available_width();
+        let show_side_rail = avail_w >= 660.0 && groups.len() > 1;
+        let rail_w = 152.0_f32;
+        let gap = 14.0_f32;
+
+        if show_side_rail {
+            let list_w = (avail_w - rail_w - gap).max(320.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                // Left "Jump to" timeline rail
+                ui.allocate_ui_with_layout(vec2(rail_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(rail_w);
+                    ui.set_max_width(rail_w);
+                    render_jump_rail(ui, p, &groups, &group_starts, state, rail_w);
+                });
+                // Right history entries column
+                ui.allocate_ui_with_layout(vec2(list_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(list_w);
+                    ui.set_max_width(list_w);
+                    render_history_groups_column(ui, p, &groups, &group_starts, total_matches, state, actions);
                 });
             });
-            ui.add_space(6.0);
-
-            for (entry_idx, entry) in entries.into_iter().enumerate() {
-                ui.push_id((group_idx, entry.unix, entry_idx), |ui| {
-                    render_history_entry_card(ui, p, entry, &mut state.open_ids, actions);
-                });
-                ui.add_space(8.0);
+        } else {
+            if groups.len() > 1 {
+                render_compact_jump_bar(ui, p, &groups, &group_starts, state);
+                ui.add_space(10.0);
             }
+            render_history_groups_column(ui, p, &groups, &group_starts, total_matches, state, actions);
         }
     }
 
@@ -466,6 +478,251 @@ pub fn render_history(
             }
         });
     });
+}
+
+fn render_jump_rail(
+    ui: &mut Ui,
+    p: &Palette,
+    groups: &[(&str, Vec<&HistoryEntry>)],
+    group_starts: &[usize],
+    state: &mut HistoryUiState,
+    rail_w: f32,
+) {
+    Frame::default()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.line))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(10, 10))
+        .show(ui, |ui| {
+            let inner_w = (rail_w - 20.0).max(90.0);
+            ui.set_width(inner_w);
+            ui.set_max_width(inner_w);
+            let title = match state.grouping {
+                HistoryGrouping::Day => "JUMP TO DATE",
+                HistoryGrouping::App => "JUMP TO APP",
+            };
+            ui.label(RichText::new(title).size(10.5).strong().color(p.faint));
+            ui.add_space(6.0);
+
+            ScrollArea::vertical()
+                .id_salt("history_jump_rail_scroll")
+                .max_height(460.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let row_w = (ui.available_width() - 4.0).max(80.0);
+                    for (idx, (key, entries)) in groups.iter().enumerate() {
+                        let active = state.selected_group.as_deref() == Some(*key);
+                        let short_lbl = match state.grouping {
+                            HistoryGrouping::Day => format_day_short(key),
+                            HistoryGrouping::App => (*key).to_owned(),
+                        };
+                        let count_str = format_count(entries.len());
+                        let (rect, resp) = ui.allocate_exact_size(vec2(row_w, 26.0), Sense::click());
+                        let painter = ui.painter();
+                        let fill = if active {
+                            blend(p.surface, p.accent, 0.16)
+                        } else if resp.hovered() {
+                            p.surface2
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        if fill != Color32::TRANSPARENT {
+                            painter.rect_filled(rect, CornerRadius::same(7), fill);
+                        }
+                        if active {
+                            painter.rect_filled(
+                                Rect::from_min_size(pos2(rect.left() + 2.0, rect.top() + 5.0), vec2(2.5, rect.height() - 10.0)),
+                                CornerRadius::same(2),
+                                p.accent,
+                            );
+                        }
+                        let lbl_col = if active || resp.hovered() { p.fg } else { p.muted };
+                        let count_gal = painter.layout_no_wrap(count_str, FontId::proportional(11.0), p.faint);
+                        let max_lbl_w = (rect.width() - count_gal.size().x - 18.0).max(30.0);
+                        let truncated = truncate_label(&short_lbl, 16);
+                        let lbl_gal = painter.layout_no_wrap(truncated, FontId::proportional(12.0), lbl_col);
+                        let _ = max_lbl_w;
+                        painter.galley(
+                            pos2(rect.left() + 9.0, rect.center().y - lbl_gal.size().y * 0.5),
+                            lbl_gal,
+                            lbl_col,
+                        );
+                        painter.galley(
+                            pos2(rect.right() - count_gal.size().x - 6.0, rect.center().y - count_gal.size().y * 0.5),
+                            count_gal,
+                            p.faint,
+                        );
+                        if resp
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(match state.grouping {
+                                HistoryGrouping::Day => format!("{} ({} dictations)", format_day_heading(key), entries.len()),
+                                HistoryGrouping::App => format!("{key} ({} dictations)", entries.len()),
+                            })
+                            .clicked()
+                        {
+                            let start = group_starts[idx];
+                            if start >= state.display_limit {
+                                let pages = (start / HISTORY_PAGE_SIZE) + 1;
+                                state.display_limit = pages * HISTORY_PAGE_SIZE;
+                            }
+                            state.collapsed_groups.remove(*key);
+                            state.selected_group = Some((*key).to_owned());
+                            state.jump_target = Some((*key).to_owned());
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+        });
+}
+
+fn render_compact_jump_bar(
+    ui: &mut Ui,
+    p: &Palette,
+    groups: &[(&str, Vec<&HistoryEntry>)],
+    group_starts: &[usize],
+    state: &mut HistoryUiState,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Jump to:").size(12.5).color(p.muted));
+        let selected_text = state
+            .selected_group
+            .as_deref()
+            .map(|k| match state.grouping {
+                HistoryGrouping::Day => format_day_heading(k),
+                HistoryGrouping::App => k.to_owned(),
+            })
+            .unwrap_or_else(|| "Select…".into());
+        ComboBox::from_id_salt("history_compact_jump")
+            .width((ui.available_width() - 70.0).clamp(150.0, 280.0))
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for (idx, (key, entries)) in groups.iter().enumerate() {
+                    let lbl = match state.grouping {
+                        HistoryGrouping::Day => format!("{} ({})", format_day_heading(key), entries.len()),
+                        HistoryGrouping::App => format!("{key} ({})", entries.len()),
+                    };
+                    let selected = state.selected_group.as_deref() == Some(*key);
+                    if ui.selectable_label(selected, lbl).clicked() {
+                        let start = group_starts[idx];
+                        if start >= state.display_limit {
+                            let pages = (start / HISTORY_PAGE_SIZE) + 1;
+                            state.display_limit = pages * HISTORY_PAGE_SIZE;
+                        }
+                        state.collapsed_groups.remove(*key);
+                        state.selected_group = Some((*key).to_owned());
+                        state.jump_target = Some((*key).to_owned());
+                    }
+                }
+            });
+    });
+}
+
+fn render_history_groups_column(
+    ui: &mut Ui,
+    p: &Palette,
+    groups: &[(&str, Vec<&HistoryEntry>)],
+    group_starts: &[usize],
+    total_matches: usize,
+    state: &mut HistoryUiState,
+    actions: &mut Vec<UiAction>,
+) {
+    let shown_count = total_matches.min(state.display_limit);
+    let summary = if shown_count < total_matches {
+        format!(
+            "Showing {} of {} dictations",
+            format_count(shown_count),
+            format_count(total_matches)
+        )
+    } else if total_matches == 1 {
+        "1 dictation".to_owned()
+    } else {
+        format!("{} dictations", format_count(total_matches))
+    };
+    ui.label(RichText::new(summary).size(12.0).color(p.faint));
+    ui.add_space(6.0);
+
+    let mut rendered_entries = 0usize;
+    for (group_idx, (key, entries)) in groups.iter().enumerate() {
+        let start = group_starts[group_idx];
+        if start >= state.display_limit {
+            break;
+        }
+        let budget = state.display_limit.saturating_sub(start);
+        let slice = &entries[..entries.len().min(budget)];
+        if slice.is_empty() {
+            continue;
+        }
+        if group_idx > 0 {
+            ui.add_space(10.0);
+        }
+
+        let heading = match state.grouping {
+            HistoryGrouping::Day => format_day_heading(key),
+            HistoryGrouping::App => (*key).to_owned(),
+        };
+        let is_open = !state.collapsed_groups.contains(*key);
+        let header_resp = ui.horizontal(|ui| {
+            let toggle = widgets::disclosure_btn(ui, p, &heading, is_open, 13.5, true, p.fg);
+            if toggle.clicked() {
+                if is_open {
+                    state.collapsed_groups.insert((*key).to_owned());
+                } else {
+                    state.collapsed_groups.remove(*key);
+                }
+                state.selected_group = Some((*key).to_owned());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let n = entries.len();
+                let count_str = if n == 1 {
+                    "1 dictation".to_owned()
+                } else {
+                    format!("{} dictations", format_count(n))
+                };
+                ui.label(RichText::new(count_str).size(11.5).color(p.faint));
+            });
+            toggle
+        });
+        if state.jump_target.as_deref() == Some(*key) {
+            header_resp.response.scroll_to_me(Some(Align::TOP));
+            state.jump_target = None;
+        }
+
+        if is_open {
+            ui.add_space(6.0);
+            for (entry_idx, entry) in slice.iter().enumerate() {
+                ui.push_id((group_idx, entry.unix, entry_idx), |ui| {
+                    render_history_entry_card(ui, p, entry, &mut state.open_ids, actions);
+                });
+                ui.add_space(8.0);
+                rendered_entries += 1;
+            }
+        } else {
+            rendered_entries += slice.len();
+        }
+    }
+
+    if total_matches > state.display_limit {
+        let remaining = total_matches - state.display_limit;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if widgets::secondary_btn(
+                ui,
+                p,
+                &format!("Show more ({} remaining)", format_count(remaining)),
+                true,
+            )
+            .clicked()
+            {
+                state.display_limit += HISTORY_PAGE_SIZE;
+            }
+            if remaining > HISTORY_PAGE_SIZE
+                && widgets::ghost_btn(ui, p, "Load +300", true).clicked()
+            {
+                state.display_limit += HISTORY_PAGE_SIZE * 5;
+            }
+        });
+    }
+    let _ = rendered_entries;
 }
 
 fn render_kpi_strip(ui: &mut Ui, p: &Palette, view: &UiView<'_>) {
@@ -565,9 +822,60 @@ fn render_kpi_card(
 }
 
 fn render_history_tools_row(ui: &mut Ui, p: &Palette, state: &mut HistoryUiState) {
+    let avail_w = ui.available_width().max(260.0);
+    let group_controls_w = 186.0_f32;
+    let gap = 12.0_f32;
+    let search_w = (avail_w - group_controls_w - gap).max(160.0);
+
     ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // Segmented control: Day | App
+        ui.spacing_mut().item_spacing.x = gap;
+
+        // Search box on the left
+        Frame::default()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0_f32, p.line))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(10, 5))
+            .show(ui, |ui| {
+                let inner_w = (search_w - 20.0).max(100.0);
+                ui.set_width(inner_w);
+                ui.set_max_width(inner_w);
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                    widgets::draw_icon(ui.painter(), icon_rect, Icon::Search, p.faint);
+
+                    let clear_reserve = if state.filter.is_empty() { 4.0 } else { 26.0 };
+                    let input_w = (ui.available_width() - clear_reserve).max(60.0);
+                    ui.add(
+                        TextEdit::singleline(&mut state.filter)
+                            .hint_text("Find words or an app...")
+                            .frame(false)
+                            .desired_width(input_w),
+                    );
+
+                    if !state.filter.is_empty() {
+                        let clear_btn = egui::Button::new(
+                            RichText::new("×").size(15.0).strong().color(p.muted),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(vec2(20.0, 20.0));
+                        if ui
+                            .add(clear_btn)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Clear search")
+                            .clicked()
+                        {
+                            state.filter.clear();
+                        }
+                    }
+                });
+            });
+
+        // Right side: "Group by:" + segmented Day | App pill
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(RichText::new("Group by:").size(12.5).color(p.muted));
             Frame::default()
                 .fill(p.surface2)
                 .stroke(Stroke::new(1.0_f32, p.line))
@@ -584,51 +892,6 @@ fn render_history_tools_row(ui: &mut Ui, p: &Palette, state: &mut HistoryUiState
                         }
                     });
                 });
-
-            ui.label(RichText::new("Group by:").size(12.5).color(p.muted));
-
-            // Search box filling remaining left width
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let search_w = ui.available_width().max(140.0);
-                Frame::default()
-                    .fill(p.surface)
-                    .stroke(Stroke::new(1.0_f32, p.line))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(10, 5))
-                    .show(ui, |ui| {
-                        ui.set_width((search_w - 20.0).max(100.0));
-                        ui.horizontal(|ui| {
-                            let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                            widgets::draw_icon(ui.painter(), icon_rect, Icon::Search, p.faint);
-
-                            let clear_reserve = if state.filter.is_empty() { 4.0 } else { 26.0 };
-                            let input_w = (ui.available_width() - clear_reserve).max(60.0);
-                            ui.add(
-                                TextEdit::singleline(&mut state.filter)
-                                    .hint_text("Find words or an app...")
-                                    .frame(false)
-                                    .desired_width(input_w),
-                            );
-
-                            if !state.filter.is_empty() {
-                                let clear_btn = egui::Button::new(
-                                    RichText::new("×").size(15.0).strong().color(p.muted),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .min_size(vec2(20.0, 20.0));
-                                if ui
-                                    .add(clear_btn)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text("Clear search")
-                                    .clicked()
-                                {
-                                    state.filter.clear();
-                                }
-                            }
-                        });
-                    });
-            });
         });
     });
 }
@@ -1008,6 +1271,64 @@ fn outcome_tint(p: &Palette, outcome: &str) -> Option<Color32> {
     }
 }
 
+fn month_short(m: u32) -> Option<&'static str> {
+    match m {
+        1 => Some("Jan"),
+        2 => Some("Feb"),
+        3 => Some("Mar"),
+        4 => Some("Apr"),
+        5 => Some("May"),
+        6 => Some("Jun"),
+        7 => Some("Jul"),
+        8 => Some("Aug"),
+        9 => Some("Sep"),
+        10 => Some("Oct"),
+        11 => Some("Nov"),
+        12 => Some("Dec"),
+        _ => None,
+    }
+}
+
+fn parse_ymd(key: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = key.split('-');
+    let y = parts.next()?.parse::<u32>().ok()?;
+    let m = parts.next()?.parse::<u32>().ok()?;
+    let d = parts.next()?.parse::<u32>().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        Some((y, m, d))
+    } else {
+        None
+    }
+}
+
+fn format_day_heading(key: &str) -> String {
+    if let Some((y, m, d)) = parse_ymd(key) {
+        if let Some(mon) = month_short(m) {
+            return format!("{mon} {d}, {y}");
+        }
+    }
+    key.to_owned()
+}
+
+fn format_day_short(key: &str) -> String {
+    if let Some((_, m, d)) = parse_ymd(key) {
+        if let Some(mon) = month_short(m) {
+            return format!("{mon} {d}");
+        }
+    }
+    key.to_owned()
+}
+
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 fn format_count(n: usize) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
@@ -1036,6 +1357,9 @@ mod tests {
         assert_eq!(format_count(999), "999");
         assert_eq!(format_count(2500), "2,500");
         assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_day_heading("2026-11-25"), "Nov 25, 2026");
+        assert_eq!(format_day_short("2026-11-25"), "Nov 25");
+        assert_eq!(format_day_short("Unknown"), "Unknown");
     }
 
     #[test]

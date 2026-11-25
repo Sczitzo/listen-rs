@@ -1726,13 +1726,17 @@ impl ListenApp {
             .frame(Frame::default().fill(p.bg).inner_margin(margin))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    let w = ui.available_width().min(max_w);
-                    let pad = ((ui.available_width() - w) * 0.5).max(0.0);
+                    // Reserve a clean 14px right gutter so the vertical scrollbar never overlaps cards
+                    let inner_avail = (ui.available_width() - 14.0).max(220.0);
+                    let w = inner_avail.min(max_w);
+                    let pad = ((inner_avail - w) * 0.5).max(0.0);
                     ui.horizontal(|ui| {
                         if pad > 0.0 {
                             ui.add_space(pad);
                         }
                         ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
+                            ui.set_width(w);
+                            ui.set_max_width(w);
                             match self.page {
                                 Page::Dictate => ui::dictate_lab::render_dictate(
                                     ui, p, &view, &mut self.vocab_buf, &mut self.show_how, &mut self.recent_open, actions,
