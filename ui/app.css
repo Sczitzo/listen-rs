@@ -435,10 +435,11 @@ select, input, .chip, .status, .switch, .rev, kbd { font-family:var(--control-fo
 .card { box-shadow:none; }
 .page-intro { color:var(--muted); font-size:13px; margin:7px 0 0; }
 .dictate-center { position:relative; display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:clamp(14px,3.2vw,26px); padding:20px 0 28px; border-bottom:1px solid var(--line); }
-.key-visual { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:7px; inline-size:max-content; min-inline-size:106px; max-inline-size:min(240px,100%); min-block-size:70px; padding:8px 10px; text-align:center; background:var(--surface); border:1px solid var(--line); border-radius:12px; }
+.key-visual { position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:7px; inline-size:max-content; min-inline-size:106px; max-inline-size:min(240px,100%); min-block-size:66px; margin-top:6px; padding:15px 12px 11px; text-align:center; background:var(--surface); border:1px solid var(--line); border-radius:12px; }
 .key-visual:hover { background:var(--surface-2); border-color:var(--accent); }
 .key-visual:focus-visible { outline:2px solid var(--focus); outline-offset:3px; }
-.key-visual>span { font:12px/1.4 var(--control-font); color:var(--muted); }
+.key-visual>span:first-child { position:absolute; top:0; left:50%; transform:translate(-50%,-50%); padding:0 7px; background:linear-gradient(to bottom,var(--bg) 50%,var(--surface) 50%); font:600 12px/1 var(--control-font); color:var(--muted); white-space:nowrap; pointer-events:none; }
+.key-visual:hover>span:first-child { background:linear-gradient(to bottom,var(--bg) 50%,var(--surface-2) 50%); color:var(--fg); }
 .hotkey-keys { --key-size:18px; display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:4px; min-inline-size:0; }
 .hotkey-keys.combo { --key-size:16px; }
 .hotkey-keys.compact { --key-size:14px; }
@@ -968,9 +969,9 @@ select[aria-invalid="true"] { border-color:var(--amber); }
   .dictate-head { gap:12px; margin-bottom:23px; }
   .dictate-head .page-intro { margin-top:7px; }
   .dictate-center { gap:24px; padding:0 0 20px; }
-  .key-visual:has(#hero-key-side:not([hidden])) { width:86px; min-inline-size:0; min-block-size:95px; gap:4px; padding:8px; transform:translateY(.5px); }
+  .key-visual:has(#hero-key-side:not([hidden])) { width:86px; min-inline-size:0; min-block-size:95px; margin-top:0; gap:4px; padding:8px; transform:translateY(.5px); }
   .key-visual:has(#hero-key-side:not([hidden])) kbd { padding:0; border:0; background:transparent; font:700 27px/1.2 var(--font); }
-  .key-visual:has(#hero-key-side:not([hidden])) > :first-child { position:relative; top:.5px; }
+  .key-visual:has(#hero-key-side:not([hidden])) > :first-child { position:relative; top:.5px; left:auto; transform:none; padding:0; background:transparent; }
   .hero-title h2 { font-size:25px; font-weight:700; margin-top:1px; }
   .hero-sub { max-width:390px; }
   .recording-actions { gap:8px; }
