@@ -156,6 +156,7 @@ pub struct HistoryUiState {
     pub collapsed_groups: HashSet<String>,
     pub selected_group: Option<String>,
     pub jump_target: Option<String>,
+    pub jump_frames: u8,
     pub display_limit: usize,
     pub last_filter: String,
     pub confirm_clear: bool,

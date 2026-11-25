@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 use std::time::Duration;
 
-const HISTORY_PAGE_SIZE: usize = 60;
+const HISTORY_PAGE_SIZE: usize = 100;
 const LONG_ENTRY_CHAR_LIMIT: usize = 420;
 const LONG_ENTRY_PREVIEW_CHARS: usize = 380;
 
@@ -594,14 +594,15 @@ fn render_jump_rail(
                             })
                             .clicked()
                         {
-                            let start = group_starts[idx];
-                            if start >= state.display_limit {
-                                let pages = (start / HISTORY_PAGE_SIZE) + 1;
-                                state.display_limit = pages * HISTORY_PAGE_SIZE;
+                            let end = group_starts[idx] + entries.len();
+                            if end > state.display_limit {
+                                state.display_limit = end;
                             }
                             state.collapsed_groups.remove(*key);
                             state.selected_group = Some((*key).to_owned());
                             state.jump_target = Some((*key).to_owned());
+                            state.jump_frames = 2;
+                            ui.ctx().request_repaint();
                         }
                         ui.add_space(2.0);
                     }
@@ -637,14 +638,15 @@ fn render_compact_jump_bar(
                     };
                     let selected = state.selected_group.as_deref() == Some(*key);
                     if ui.selectable_label(selected, lbl).clicked() {
-                        let start = group_starts[idx];
-                        if start >= state.display_limit {
-                            let pages = (start / HISTORY_PAGE_SIZE) + 1;
-                            state.display_limit = pages * HISTORY_PAGE_SIZE;
+                        let end = group_starts[idx] + entries.len();
+                        if end > state.display_limit {
+                            state.display_limit = end;
                         }
                         state.collapsed_groups.remove(*key);
                         state.selected_group = Some((*key).to_owned());
                         state.jump_target = Some((*key).to_owned());
+                        state.jump_frames = 2;
+                        ui.ctx().request_repaint();
                     }
                 }
             });
@@ -661,11 +663,17 @@ fn render_history_groups_column(
     state: &mut HistoryUiState,
     actions: &mut Vec<UiAction>,
 ) {
-    let shown_count = total_matches.min(state.display_limit);
-    let summary = if shown_count < total_matches {
+    let mut rendered_count = 0usize;
+    for (group_idx, (_, entries)) in groups.iter().enumerate() {
+        if group_starts[group_idx] >= state.display_limit {
+            break;
+        }
+        rendered_count += entries.len();
+    }
+    let summary = if rendered_count < total_matches {
         format!(
             "Showing {} of {} dictations",
-            format_count(shown_count),
+            format_count(rendered_count),
             format_count(total_matches)
         )
     } else if total_matches == 1 {
@@ -682,8 +690,8 @@ fn render_history_groups_column(
         if start >= state.display_limit {
             break;
         }
-        let budget = state.display_limit.saturating_sub(start);
-        let slice = &entries[..entries.len().min(budget)];
+        // Always render every entry in a started group so no day/app is ever sliced in half
+        let slice = entries.as_slice();
         if slice.is_empty() {
             continue;
         }
@@ -737,7 +745,13 @@ fn render_history_groups_column(
         });
         if state.jump_target.as_deref() == Some(*key) {
             header_resp.response.scroll_to_me(Some(Align::TOP));
-            state.jump_target = None;
+            if state.jump_frames > 1 {
+                state.jump_frames -= 1;
+                ui.ctx().request_repaint();
+            } else {
+                state.jump_frames = 0;
+                state.jump_target = None;
+            }
         }
 
         if is_open {
@@ -790,8 +804,8 @@ fn render_history_groups_column(
         }
     }
 
-    if total_matches > state.display_limit {
-        let remaining = total_matches - state.display_limit;
+    if rendered_count < total_matches {
+        let remaining = total_matches - rendered_count;
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if widgets::secondary_btn(
@@ -802,12 +816,12 @@ fn render_history_groups_column(
             )
             .clicked()
             {
-                state.display_limit += HISTORY_PAGE_SIZE;
+                state.display_limit = rendered_count + HISTORY_PAGE_SIZE;
             }
             if remaining > HISTORY_PAGE_SIZE
-                && widgets::ghost_btn(ui, p, "Load +300", true).clicked()
+                && widgets::ghost_btn(ui, p, "Load +500", true).clicked()
             {
-                state.display_limit += HISTORY_PAGE_SIZE * 5;
+                state.display_limit = rendered_count + HISTORY_PAGE_SIZE * 5;
             }
         });
     }
