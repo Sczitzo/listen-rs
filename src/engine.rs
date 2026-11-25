@@ -45,7 +45,7 @@ pub enum Cmd {
     Finish,
     Cancel,
     CancelLantern { generation: u64 },
-    StartMeeting { reply: mpsc::SyncSender<Result<audio::MeetingStartInfo, String>> },
+    StartMeeting { include_system_audio: bool, reply: mpsc::SyncSender<Result<audio::MeetingStartInfo, String>> },
     StopMeeting { reply: mpsc::SyncSender<Result<(), String>> },
     CancelMeeting,
     Lab { action: LabAction, text: String, instruction: String },
@@ -271,6 +271,10 @@ impl Core {
     }
 
     pub fn start_meeting(&self) -> Result<audio::MeetingStartInfo, String> {
+        self.start_meeting_with_loopback(true)
+    }
+
+    pub fn start_meeting_with_loopback(&self, include_system_audio: bool) -> Result<audio::MeetingStartInfo, String> {
         if self.preview {
             return Err("Meeting recording is unavailable in sample mode.".into());
         }
@@ -282,7 +286,7 @@ impl Core {
         }
         let (reply, rx) = mpsc::sync_channel(1);
         self.tx
-            .send(Cmd::StartMeeting { reply })
+            .send(Cmd::StartMeeting { include_system_audio, reply })
             .map_err(|_| "Listen background controller is unavailable.".to_owned())?;
         self.repaint();
         rx.recv_timeout(Duration::from_secs(6))
@@ -1129,7 +1133,7 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                     core.cue(Cue::Cancel);
                 }
             }
-            Cmd::StartMeeting { reply } => {
+            Cmd::StartMeeting { include_system_audio, reply } => {
                 if core.phase() != Phase::Idle {
                     let _ = reply.send(Err("Finish the current dictation before starting a meeting.".into()));
                     continue;
@@ -1151,7 +1155,7 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                     }
                 }
                 let s = core.settings();
-                let start_res = meeting_recorder.lock().unwrap().start_meeting(&s.microphone);
+                let start_res = meeting_recorder.lock().unwrap().start_meeting(&s.microphone, include_system_audio);
                 match start_res {
                     Ok(info) => {
                         let my_gen = {

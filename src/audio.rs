@@ -543,7 +543,7 @@ impl MeetingMixBuffer {
 }
 
 enum MeetingCmd {
-    Start(String, mpsc::Sender<Result<MeetingStartInfo, String>>),
+    Start(String, bool, mpsc::Sender<Result<MeetingStartInfo, String>>),
     Stop(mpsc::Sender<Vec<f32>>),
     Cancel,
 }
@@ -572,11 +572,11 @@ impl MeetingRecorder {
         Self { tx, mix }
     }
 
-    /// Start capturing both the selected microphone and default system output loopback.
-    /// If loopback cannot be opened, falls back cleanly to mic-only with `loopback_active: false`.
-    pub fn start_meeting(&self, device: &str) -> Result<MeetingStartInfo, String> {
+    /// Start capturing the selected microphone and optionally default system output loopback.
+    /// If loopback is enabled but cannot be opened, falls back cleanly to mic-only with `loopback_active: false`.
+    pub fn start_meeting(&self, device: &str, include_system_audio: bool) -> Result<MeetingStartInfo, String> {
         let (t, r) = mpsc::channel();
-        let _ = self.tx.send(MeetingCmd::Start(device.to_string(), t));
+        let _ = self.tx.send(MeetingCmd::Start(device.to_string(), include_system_audio, t));
         r.recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|_| Err("the meeting recorder didn't respond".into()))
     }
@@ -620,7 +620,7 @@ fn meeting_audio_thread(
 
     for cmd in rx {
         match cmd {
-            MeetingCmd::Start(device_name, reply) => {
+            MeetingCmd::Start(device_name, include_system_audio, reply) => {
                 current = None;
                 mic_level.store(0, Ordering::Relaxed);
                 loop_level.store(0, Ordering::Relaxed);
@@ -629,6 +629,7 @@ fn meeting_audio_thread(
 
                 match open_meeting_streams(
                     &device_name,
+                    include_system_audio,
                     mix.clone(),
                     level.clone(),
                     mic_level.clone(),
@@ -665,6 +666,7 @@ fn meeting_audio_thread(
 
 fn open_meeting_streams(
     mic_name: &str,
+    include_system_audio: bool,
     mix: Arc<Mutex<MeetingMixBuffer>>,
     combined_level: Arc<AtomicU32>,
     mic_level: Arc<AtomicU32>,
@@ -698,11 +700,14 @@ fn open_meeting_streams(
     )?;
     mic_stream.play().map_err(|e| format!("microphone: {e}"))?;
 
-    let (loopback_stream, loopback_label, loopback_warning) =
+    let (loopback_stream, loopback_label, loopback_warning) = if include_system_audio {
         match open_loopback_stream(&host, mix, loop_level, mic_level, combined_level) {
             Ok((stream, label)) => (Some(stream), Some(label), None),
             Err(reason) => (None, None, Some(reason)),
-        };
+        }
+    } else {
+        (None, None, None)
+    };
 
     let info = MeetingStartInfo {
         mic_label,

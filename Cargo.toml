@@ -3,7 +3,7 @@ name = "listen-rs"
 version = "0.1.0"
 edition = "2021"
 authors = ["Sczitzo"]
-description = "Fast, private, local push-to-talk voice dictation, command mode, and meeting notetaker for Windows — native Rust rebuild of Listen."
+description = "Fast, private, 100% pure-Rust local push-to-talk voice dictation, command mode, and meeting notetaker for Windows."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Sczitzo/listen-rs"
@@ -37,9 +37,6 @@ find-msvc-tools = "0.1.15"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "=5.4.3"
-wry = { version = "=0.57.3", default-features = false }
-webview2-com = "=0.39.1"
-windows = { version = "=0.62.2", features = ["Win32_System_Com_StructuredStorage"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

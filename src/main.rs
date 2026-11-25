@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Listen — a native Rust rebuild of the Listen dictation app (original by Sczitzo, MIT License;
-//! name used with the owner's confirmation).
+//! Listen — 100% pure-Rust native local dictation, Command Mode, and meeting notetaker for Windows
+//! (original by Sczitzo, MIT License).
 
 mod app;
 mod app_tone;
@@ -8,8 +8,6 @@ mod audio;
 mod cleanup;
 mod command_mode;
 mod controller;
-#[cfg(windows)]
-mod dashboard;
 mod dashboard_state;
 mod diagnostics;
 mod engine;
@@ -27,6 +25,7 @@ mod speech;
 mod storage;
 mod theme;
 mod tray;
+mod ui;
 mod winput;
 mod workspace;
 
@@ -72,9 +71,9 @@ fn main() -> eframe::Result<()> {
                 }
                 opts.hardware_trial = Some(directory);
             }
-            "--dashboard-check" => {
+            "--dashboard-check" | "--ui-check" => {
                 let Some(directory) = args.next() else { return Ok(()) };
-                opts.dashboard_check = Some(PathBuf::from(directory));
+                opts.ui_check = Some(PathBuf::from(directory));
             }
             "--screenshot" => {
                 let Some(path) = args.next() else {
@@ -94,15 +93,16 @@ fn main() -> eframe::Result<()> {
             "--theme" => opts.theme = args.next().and_then(|v| ThemeId::from_key(&v)),
             "--layout" => opts.layout = args.next().and_then(|v| LayoutId::from_key(&v)),
             "--page" => opts.page = args.next().and_then(|v| Page::from_key(&v)),
+            "--settings-section" => opts.settings_section = args.next(),
             "--demo-recording" => opts.demo_recording = true,
             _ => {}
         }
     }
-    let preview = opts.screenshot.is_some() || opts.dashboard_check.is_some();
+    let preview = opts.screenshot.is_some() || opts.ui_check.is_some();
     if !preview && !winput::single_instance() {
         return Ok(());
     }
-    let report_profile = opts.dashboard_check.clone()
+    let report_profile = opts.ui_check.clone()
         .or_else(|| opts.screenshot.as_ref().map(|file| file.with_extension("profile")))
         .unwrap_or_else(storage::data_dir);
     diagnostics::install_crash_report(&report_profile);
@@ -110,34 +110,20 @@ fn main() -> eframe::Result<()> {
         opts.launch_target = winput::capture_target();
     }
     let mut settings = if preview { storage::Settings::default() } else { storage::load_settings() };
-    if opts.original_picture() {
-        settings.vocab = concat!(
-            "YouTube, Gemini, GitHub, Google, TikTok, Twitch, Figma, Melty, Bluetooth, Claude Code, Codex, ",
-            "CLAUDE.md, Claude, Ollama, Qwen, OpenCode, WhisperFlow, MCP, Impeccable, Playwright, ",
-            "DaVinci Resolve, Visual Studio, Microsoft, Windows, WebView2, Python, Rust, Chromium, Firefox, ",
-            "Audacity, Parakeet, Vulkan, Git, PowerShell, Notepad, Fedora, Linux, SQLite"
-        ).into();
-    }
-    if opts.dashboard_check.is_some() {
+    if opts.ui_check.is_some() {
         settings.microphone = "Disconnected sample microphone".into();
         settings.live_preview = true;
         settings.floating_card = true;
     }
-    // A screenshot shows the original's own look (desk layout) unless --layout says otherwise,
-    // so a saved compact/midnight choice doesn't change what --screenshot draws.
     let layout = if preview { opts.layout.unwrap_or(LayoutId::Desk) } else { opts.layout.unwrap_or(settings.layout) };
     let size = if opts.demo_lantern {
         [lantern::WIDTH, 247.0]
     } else if layout == LayoutId::Compact {
         [480.0, 760.0]
-    } else if opts.original_picture() {
-        // Match the app content area in the supplied picture.
-        [708.0, 712.0]
     } else if preview {
-        [812.0, 800.0]
+        [920.0, 760.0]
     } else {
-        // dictate.py: webview.create_window(..., width=900, height=700, min_size=(720, 520)).
-        [900.0, 700.0]
+        [920.0, 720.0]
     };
 
     let mut viewport = egui::ViewportBuilder::default()

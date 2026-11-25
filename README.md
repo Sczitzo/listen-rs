@@ -76,8 +76,8 @@ Measured directly on Windows 11 (RTX 4060 8 GB) using an isolated automated comp
 | Metric | Listen (`listen-rs`, Rust) | Original Listen (Python/JS) | Typical Cloud Dictation Apps |
 |---|---|---|---|
 | **Cold readiness (median ×5)** | **98.0 ms** *(6.9× faster)* | 672.7 ms (Python import) | Cloud round-trip per utterance |
-| **Runtime footprint** *(excl. speech weights)* | **65.8 MB** *(12.1 MB `.exe` + 53.6 MB DLLs)* | 1,950.5 MB *(14 pip/CUDA packages)* | Electron / cloud client |
-| **External runtime installs** | **0** *(built-in Windows WebView2)* | Python 3.13 + 14 pinned packages | Account + always-on cloud |
+| **Runtime footprint** *(excl. speech weights)* | **65.2 MB** *(11.6 MB `.exe` + 53.6 MB DLLs)* | 1,950.5 MB *(14 pip/CUDA packages)* | Electron / cloud client |
+| **External runtime installs** | **0** *(100% pure-Rust GPU UI, zero WebView2/JS)* | Python 3.13 + 14 pinned packages | Account + always-on cloud |
 | **Speech privacy** | **100% local (offline)** | 100% local (offline) | Audio uploaded to cloud servers |
 | **Monthly cost** | **\$0 (MIT open source)** | \$0 (MIT open source) | \$10–\$15 / month subscription |
 | **30-case dictation corpus** | **30 / 30 (100%)** | 18 / 30 (60%) | Proprietary / unverified |
@@ -86,7 +86,7 @@ Measured directly on Windows 11 (RTX 4060 8 GB) using an isolated automated comp
 | **App-Aware Tone & Quiet Mode** | **Yes** | No | Partial / paid |
 | **Local Meeting Notetaker** | **Yes (WASAPI loopback + mic)** | No | Separate paid bot / cloud upload |
 | **Color themes & layouts** | **12 WCAG AA themes · 3 layouts** | 1 theme · 1 layout | 1–2 themes |
-| **Automated verification** | **101 Rust + 79 live WebView2 + 13 parity** | 78 Python suites (no live WebView2 gate) | Closed |
+| **Automated verification** | **100+ Rust tests + pure-Rust `--ui-check` + 13 parity** | 78 Python suites | Closed |
 
 ---
 
@@ -98,7 +98,7 @@ Measured directly on Windows 11 (RTX 4060 8 GB) using an isolated automated comp
 3. Double-click **`Listen.exe`**.
 4. Hold **`Right Ctrl`**, speak into any app, and release.
 
-**Requirements:** Windows 10 (1903+) or Windows 11 (x64). WebView2 Runtime is built into Windows 11 and modern Windows 10. Optional local AI formatting uses [Ollama](https://ollama.com/) (`http://127.0.0.1:11434`).
+**Requirements:** Windows 10 (1903+) or Windows 11 (x64). Zero browser runtime or WebView2 required — the entire UI and engine run natively in pure Rust (`eframe`/`egui`). Optional local AI formatting uses [Ollama](https://ollama.com/) (`http://127.0.0.1:11434`).
 
 ### Option 2: Build from Source (Rust)
 
@@ -121,11 +121,11 @@ To assemble a portable `dist\Listen\` folder with the local `transcribe.dll` spe
 .\package.bat
 ```
 
-To run the parity verification suite and live WebView2 interactive UI gate:
+To run the parity verification suite and native pure-Rust UI check:
 
 ```powershell
 python tools/check_mechanics.py
-.\target\release\listen-rs.exe --dashboard-check .\temp-ui-check
+.\target\release\listen-rs.exe --ui-check .\temp-ui-check
 ```
 
 ---

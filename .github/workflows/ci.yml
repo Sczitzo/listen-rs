@@ -19,13 +19,8 @@ jobs:
       - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Check UI JavaScript syntax
-        run: |
-          node --check ui/app.js
-          node --check ui/model-benchmarks.js
-
-      - name: Run unit tests (101+ tests including WCAG AA contrast & formatting safety)
+      - name: Run pure-Rust unit tests (including WCAG AA contrast & formatting safety)
         run: cargo test --locked
 
-      - name: Build Windows release binary
+      - name: Build native Windows release binary
         run: cargo build --release --locked
