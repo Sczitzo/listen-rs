@@ -1249,15 +1249,40 @@ mod imp {
         assert!(matches!(paused, Err(DeliveryError::NotSent(_))));
     }
 
-    /// Returns false when another copy is already running.
+    /// Auto-reset event signaled when a second Listen.exe launch asks the running instance to show its window.
+    static SHOW_EVENT: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+    /// Returns false when another copy is already running (and signals it to show its window).
     pub fn single_instance() -> bool {
-        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-        use windows_sys::Win32::System::Threading::CreateMutexW;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW, OpenEventW, SetEvent, EVENT_MODIFY_STATE};
         let name: Vec<u16> = "Local\\ListenRsSingleInstance\0".encode_utf16().collect();
+        let show_name: Vec<u16> = "Local\\ListenRsShowWindow\0".encode_utf16().collect();
         unsafe {
             let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-            !h.is_null() && GetLastError() != ERROR_ALREADY_EXISTS
+            if !h.is_null() && GetLastError() != ERROR_ALREADY_EXISTS {
+                let ev = CreateEventW(std::ptr::null(), 0, 0, show_name.as_ptr());
+                if !ev.is_null() {
+                    let _ = SHOW_EVENT.set(ev as isize);
+                }
+                true
+            } else {
+                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, show_name.as_ptr());
+                if !ev.is_null() {
+                    SetEvent(ev);
+                    CloseHandle(ev);
+                }
+                false
+            }
         }
+    }
+
+    /// Returns true once whenever another Listen.exe launch asked to bring this window to the front.
+    pub fn take_show_request() -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let Some(&ev) = SHOW_EVENT.get() else { return false };
+        unsafe { WaitForSingleObject(ev as windows_sys::Win32::Foundation::HANDLE, 0) == WAIT_OBJECT_0 }
     }
 
     /// Where the window was before it was tucked away, so "Open Listen" puts it back.
@@ -1381,6 +1406,9 @@ mod imp {
     pub(crate) fn shutdown_clipboard() {}
     pub fn single_instance() -> bool {
         true
+    }
+    pub fn take_show_request() -> bool {
+        false
     }
     pub fn hide_window(_hwnd: isize) {}
     pub fn show_window(_hwnd: isize) {}

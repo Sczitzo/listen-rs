@@ -910,6 +910,9 @@ impl ListenApp {
     /// Handle tray choices and keep the icon, tooltip and favorites current.
     fn tray_step(&mut self, ctx: &egui::Context) {
         use crate::tray::{TrayAction, TrayState};
+        if winput::take_show_request() {
+            winput::show_window(self.hwnd);
+        }
         let Some(tray) = self.tray.as_mut() else { return };
         for a in tray.poll() {
             if matches!(a, TrayAction::Open | TrayAction::PromptLab | TrayAction::Settings) {
@@ -1322,7 +1325,7 @@ impl ListenApp {
             return;
         }
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-        if self.tray.is_some() && std::env::var_os("LISTEN_PARK_ON_CLOSE").is_some() {
+        if should_hide_on_close(self.tray.is_some(), self.preview()) {
             winput::hide_window(self.hwnd);
         } else {
             self.request_quit(ctx);
@@ -3218,4 +3221,22 @@ fn frame_titled(ui: &mut Ui, p: &Palette, title: &str, link: Option<&str>, focus
     }
     clicked
 }
+
+fn should_hide_on_close(has_tray: bool, preview: bool) -> bool {
+    has_tray && !preview
+}
+
+#[cfg(test)]
+mod close_policy_tests {
+    use super::should_hide_on_close;
+
+    #[test]
+    fn window_close_hides_to_tray_by_default_unless_preview_or_no_tray() {
+        assert!(should_hide_on_close(true, false));
+        assert!(!should_hide_on_close(false, false));
+        assert!(!should_hide_on_close(true, true));
+        assert!(!should_hide_on_close(false, true));
+    }
+}
+
 
