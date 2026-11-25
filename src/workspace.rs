@@ -85,6 +85,17 @@ impl Assessment {
             return None;
         }
         result.criteria.retain(|key, _| REQUIRED_CRITERIA.contains(&key.as_str()));
+        // Fast/small judge models occasionally emit `score` on the 1..5 criteria scale
+        // (e.g., criteria avg 3.8/5 -> score: 4) instead of 1..10. Normalize that clearly
+        // so Refine does not stall at 4/10 when criteria are strong.
+        let avg_criteria = result.criteria.values().copied().sum::<f64>()
+            / (result.criteria.len().max(1) as f64);
+        if result.score <= 5.0
+            && avg_criteria >= 3.2
+            && (result.score - avg_criteria).abs() <= 0.65
+        {
+            result.score = (result.score * 2.0).clamp(1.0, 10.0);
+        }
         result.improved = strip_echoed_draft_tags(&result.improved, "");
         result.by = by;
         result.feedback_id = Some(id);
@@ -1679,5 +1690,21 @@ mod tests {
         // Echoed outer <draft> tags are stripped unless source itself started with <draft>.
         assert_eq!(strip_echoed_draft_tags("<draft>\nClean prompt\n</draft>", "Raw draft"), "Clean prompt");
         assert_eq!(strip_echoed_draft_tags("<draft>\nKept\n</draft>", "<draft>original</draft>"), "<draft>\nKept\n</draft>");
+
+        // Scale-confused judge returning 1..5 average (4.0) when criteria avg 3.83/5 normalizes to 8.0/10,
+        // while a genuine weak 4/10 (criteria avg 2.0/5) remains 4.0/10.
+        let confused = Assessment::parse(
+            r#"{"score":4,"criteria":{"clarity":4,"context":3,"task":4,"constraints":5,"success_criteria":3,"format":4},"gaps":["Tighten criteria"],"improved":""}"#,
+            "gemini-3.5-flash-lite".into(),
+            9,
+        ).unwrap();
+        assert_eq!(confused.score, 8.0);
+
+        let genuinely_low = Assessment::parse(
+            r#"{"score":4,"criteria":{"clarity":2,"context":2,"task":2,"constraints":2,"success_criteria":2,"format":2},"gaps":["Too vague"],"improved":""}"#,
+            "gemini-3.5-flash-lite".into(),
+            10,
+        ).unwrap();
+        assert_eq!(genuinely_low.score, 4.0);
     }
 }

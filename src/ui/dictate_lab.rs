@@ -635,7 +635,7 @@ fn render_recent_card(
     });
 }
 
-/// Render the Prompt Lab screen and optional Compare suggestion modal.
+/// Render the Prompt Lab screen matching `main`'s clean single-button Engineer -> Copy + Refine workflow.
 pub fn render_lab(
     ui: &mut Ui,
     ctx: &egui::Context,
@@ -646,59 +646,93 @@ pub fn render_lab(
 ) {
     let busy = !state.busy_label.is_empty() || view.snap.lab_busy;
     let has_draft = !state.draft.trim().is_empty();
+    let has_fresh_grade = state.assessment.as_ref().and_then(|a| a.score).is_some() && !state.assessment_stale;
+    let has_pending = state.candidate.is_some();
 
-    // Header bar: active Prompt Target pill + model summary on left, New draft + Library on right.
+    // Top bar (matching main): quiet right-aligned "Models ▾" toggle + "New draft"
     render_lab_header(ui, p, view, state, busy, actions);
 
-    // Inline Favorites Library panel when toggled open.
+    // Inline Models popover card when opened
+    if state.show_models_popover {
+        ui.add_space(8.0);
+        render_models_popover(ui, p, view, state);
+    }
+
+    // Inline Favorites Library panel when toggled open from ··· menu
     if state.show_library {
         ui.add_space(10.0);
         render_favorites_panel(ui, p, view, state, actions);
     }
 
-    // Draft card with score badge, saved note, revisions selector, and multiline editor.
-    ui.add_space(12.0);
+    // Clean full-height Draft card (score badge on border, saved note + revisions dropdown, uncluttered editor)
+    ui.add_space(10.0);
     render_draft_card(ui, p, state, actions);
 
-    // Primary action row.
+    // Primary action row matching main:
+    // - Before scoring: [ Engineer ]  ...  [ ··· ]
+    // - Once scored:    [ Copy ] [ Refine ]  ...  [ ··· ]
     ui.add_space(10.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-        if widgets::primary_btn(ui, p, "Engineer", has_draft && !busy).clicked() {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        if has_fresh_grade {
+            if widgets::primary_btn(ui, p, "Copy", has_draft && !busy).clicked() {
+                actions.push(UiAction::CopyText(state.draft.clone(), "Copied draft"));
+            }
+            if widgets::secondary_btn(ui, p, "Refine", has_draft && !busy).clicked() {
+                actions.push(UiAction::LabEngineer);
+            }
+        } else if widgets::primary_btn(ui, p, "Engineer", has_draft && !busy).clicked() {
             actions.push(UiAction::LabEngineer);
         }
-        if widgets::secondary_btn(ui, p, "Suggest changes", has_draft && !busy).clicked() {
-            actions.push(UiAction::LabSuggestChanges);
-        }
-        if widgets::secondary_btn(ui, p, "Rewrite", has_draft && !busy).clicked() {
-            actions.push(UiAction::LabRewriteScratch);
-        }
-        if widgets::secondary_btn(ui, p, "Copy", has_draft).clicked() {
-            actions.push(UiAction::CopyText(state.draft.clone(), "Copied draft"));
-        }
-        if widgets::secondary_btn(ui, p, "Paste", has_draft).clicked() {
-            actions.push(UiAction::LabPasteDraft);
-        }
-        if widgets::ghost_btn(ui, p, "Save favorite", has_draft).clicked() {
-            state.save_fav_open = !state.save_fav_open;
-        }
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let more_fill = if state.show_more_menu {
+                blend(p.surface, p.accent, 0.16)
+            } else {
+                Color32::TRANSPARENT
+            };
+            let more_stroke = if state.show_more_menu {
+                Stroke::new(1.0_f32, p.accent.gamma_multiply(0.75))
+            } else {
+                Stroke::new(1.0_f32, p.line)
+            };
+            let more_btn = egui::Button::new(RichText::new("···").size(15.0).strong().color(p.fg))
+                .fill(more_fill)
+                .stroke(more_stroke)
+                .corner_radius(CornerRadius::same(8))
+                .min_size(vec2(38.0, 32.0));
+            if ui
+                .add(more_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("More draft actions")
+                .clicked()
+            {
+                state.show_more_menu = !state.show_more_menu;
+            }
+        });
     });
 
-    // Inline Save Favorite prompt when toggled open.
+    // Overflow "More draft actions" panel (Suggest changes, Rewrite from scratch, Paste, Save favorite, Library)
+    if state.show_more_menu {
+        ui.add_space(8.0);
+        render_more_actions_bar(ui, p, view, state, has_draft, busy, actions);
+    }
+
+    // Inline Save Favorite prompt when toggled open
     if state.save_fav_open {
         ui.add_space(10.0);
         render_save_favorite_prompt(ui, p, state, has_draft, actions);
     }
 
-    // Busy / Error / Candidate bar.
-    render_lab_status_bars(ui, p, state, busy, actions);
+    // Quiet status line + "View feedback ▸" / "Compare suggestion ▸" trigger (matching main)
+    render_lab_status_bars(ui, p, state, busy, has_fresh_grade, actions);
 
-    // Collapsible Earlier draft tools section.
+    // Collapsible Earlier draft tools section (Instruction + Write suggestion + Get feedback + Archived)
     ui.add_space(14.0);
     render_earlier_tools(ui, p, state, has_draft, busy, actions);
 
-    // Side-by-side Compare suggestion modal.
-    if state.compare_open && state.candidate.is_some() {
+    // Unified Feedback / Compare suggestion modal
+    if state.compare_open && (has_pending || state.assessment.is_some()) {
         render_compare_modal(ctx, p, state, busy, actions);
     }
 }
@@ -710,6 +744,44 @@ fn render_lab_header(
     state: &mut LabUiState,
     busy: bool,
     actions: &mut Vec<UiAction>,
+) {
+    let engine_local = if view.settings.engine_local_model.trim().is_empty() {
+        view.settings.local_model.as_str()
+    } else {
+        view.settings.engine_local_model.as_str()
+    };
+    let writing = provider_model_summary(
+        view.settings.prompt_engine,
+        engine_local,
+        &view.settings.claude_model,
+    );
+    let models_btn_label = format!("Models · {writing}");
+
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if widgets::secondary_btn(ui, p, "New draft", !busy).clicked() {
+                state.show_more_menu = false;
+                state.show_models_popover = false;
+                actions.push(UiAction::LabNewDraft);
+            }
+            let toggle = if state.show_models_popover {
+                widgets::secondary_btn(ui, p, &models_btn_label, true)
+            } else {
+                widgets::ghost_btn(ui, p, &models_btn_label, true)
+            };
+            if toggle.on_hover_text("View active Prompt Lab target and models").clicked() {
+                state.show_models_popover = !state.show_models_popover;
+            }
+        });
+    });
+}
+
+fn render_models_popover(
+    ui: &mut Ui,
+    p: &Palette,
+    view: &UiView<'_>,
+    state: &mut LabUiState,
 ) {
     let engine_local = if view.settings.engine_local_model.trim().is_empty() {
         view.settings.local_model.as_str()
@@ -731,55 +803,70 @@ fn render_lab_header(
         judge_local,
         &view.settings.claude_model,
     );
-    let model_summary = format!("Writing: {writing} · Checking: {checking}");
+    widgets::card_frame(p).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+            widgets::badge(ui, p, view.settings.prompt_target.label(), Some(p.accent));
+            widgets::badge(ui, p, &format!("Writing: {writing}"), None);
+            widgets::badge(ui, p, &format!("Checking: {checking}"), None);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::ghost_btn(ui, p, "Close", true).clicked() {
+                    state.show_models_popover = false;
+                }
+            });
+        });
+    });
+}
+
+fn render_more_actions_bar(
+    ui: &mut Ui,
+    p: &Palette,
+    view: &UiView<'_>,
+    state: &mut LabUiState,
+    has_draft: bool,
+    busy: bool,
+    actions: &mut Vec<UiAction>,
+) {
     let lib_label = if view.favorites.is_empty() {
         "Library".to_owned()
     } else {
         format!("Library ({})", view.favorites.len())
     };
-
-    let wide = ui.available_width() >= 580.0;
-    if wide {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            widgets::badge(ui, p, view.settings.prompt_target.label(), Some(p.accent));
-            ui.label(RichText::new(&model_summary).size(12.5).color(p.muted));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let lib_btn = if state.show_library {
-                    widgets::primary_btn(ui, p, &lib_label, true)
-                } else {
-                    widgets::secondary_btn(ui, p, &lib_label, true)
-                };
-                if lib_btn.clicked() {
-                    state.show_library = !state.show_library;
+    Frame::default()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.line))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                if widgets::secondary_btn(ui, p, "Suggest changes", has_draft && !busy).clicked() {
+                    state.show_more_menu = false;
+                    actions.push(UiAction::LabSuggestChanges);
                 }
-                if widgets::secondary_btn(ui, p, "New draft", !busy).clicked() {
-                    actions.push(UiAction::LabNewDraft);
+                if widgets::secondary_btn(ui, p, "Rewrite from scratch", has_draft && !busy).clicked() {
+                    state.show_more_menu = false;
+                    actions.push(UiAction::LabRewriteScratch);
+                }
+                if widgets::secondary_btn(ui, p, "Paste", has_draft && !busy)
+                    .on_hover_text("Ctrl+Enter · pastes into the window you came from")
+                    .clicked()
+                {
+                    state.show_more_menu = false;
+                    actions.push(UiAction::LabPasteDraft);
+                }
+                if widgets::secondary_btn(ui, p, "Save favorite", has_draft).clicked() {
+                    state.show_more_menu = false;
+                    state.save_fav_open = !state.save_fav_open;
+                }
+                if widgets::secondary_btn(ui, p, &lib_label, true).clicked() {
+                    state.show_more_menu = false;
+                    state.show_library = !state.show_library;
                 }
             });
         });
-    } else {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-            widgets::badge(ui, p, view.settings.prompt_target.label(), Some(p.accent));
-            ui.label(RichText::new(&model_summary).size(12.5).color(p.muted));
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if widgets::secondary_btn(ui, p, "New draft", !busy).clicked() {
-                actions.push(UiAction::LabNewDraft);
-            }
-            let lib_btn = if state.show_library {
-                widgets::primary_btn(ui, p, &lib_label, true)
-            } else {
-                widgets::secondary_btn(ui, p, &lib_label, true)
-            };
-            if lib_btn.clicked() {
-                state.show_library = !state.show_library;
-            }
-        });
-    }
 }
 
 fn render_favorites_panel(
@@ -860,9 +947,13 @@ fn render_draft_card(
     state: &mut LabUiState,
     actions: &mut Vec<UiAction>,
 ) {
-    let score_badge = match state.assessment.as_ref().and_then(|a| a.score) {
-        Some(n) => format!("Score {n}/10"),
-        None => "Not scored".to_owned(),
+    let score_badge = if state.assessment_stale {
+        "Not scored".to_owned()
+    } else {
+        match state.assessment.as_ref().and_then(|a| a.score) {
+            Some(n) => format!("Score {n}/10"),
+            None => "Not scored".to_owned(),
+        }
     };
     let draft_id = egui::Id::new("lab_draft_editor");
     let focused = ui.ctx().memory(|m| m.has_focus(draft_id));
@@ -931,35 +1022,13 @@ fn render_draft_card(
         let resp = ui.add(
             TextEdit::multiline(&mut state.draft)
                 .id(draft_id)
-                .desired_rows(9)
+                .desired_rows(12)
                 .desired_width(f32::INFINITY)
                 .margin(Margin::same(12))
-                .hint_text("Dictate, paste, or type your prompt draft here…"),
+                .hint_text("Write a prompt or describe what you want it to do."),
         );
         if resp.changed() {
             actions.push(UiAction::LabDraftChanged(state.draft.clone()));
-        }
-
-        if let Some(assess) = &state.assessment {
-            if assess.score.is_some()
-                || !assess.summary.trim().is_empty()
-                || !assess.gaps.is_empty()
-                || !assess.criteria.is_empty()
-            {
-                ui.add_space(10.0);
-                let score_avail = ui.available_width();
-                Frame::default()
-                    .fill(p.surface2)
-                    .stroke(Stroke::new(1.0_f32, p.line_faint()))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(12, 9))
-                    .show(ui, |ui| {
-                        let inner_w = (score_avail - 24.0).max(160.0);
-                        ui.set_width(inner_w);
-                        ui.set_max_width(inner_w);
-                        render_assessment_summary(ui, p, assess, true);
-                    });
-            }
         }
     });
 }
@@ -1009,115 +1078,70 @@ fn render_lab_status_bars(
     p: &Palette,
     state: &mut LabUiState,
     busy: bool,
+    has_fresh_grade: bool,
     actions: &mut Vec<UiAction>,
 ) {
-    if busy {
-        ui.add_space(10.0);
-        Frame::default()
-            .fill(p.surface2)
-            .stroke(Stroke::new(1.0_f32, p.line_soft()))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(12, 9))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(15.0).color(p.accent));
-                    let msg = if state.busy_label.trim().is_empty() {
-                        "Working on your draft…"
-                    } else {
-                        state.busy_label.as_str()
-                    };
-                    ui.label(RichText::new(msg).size(13.0).color(p.fg));
+    let has_pending = state.candidate.is_some();
+    let has_feedback = state.assessment.is_some();
+
+    let status_msg: Option<(String, Color32)> = if busy {
+        let msg = if state.busy_label.trim().is_empty() {
+            "Working on your draft…".to_owned()
+        } else {
+            state.busy_label.clone()
+        };
+        Some((msg, p.fg))
+    } else if let Some(err) = state.error.as_deref().filter(|e| !e.trim().is_empty()) {
+        Some((err.to_owned(), p.rec))
+    } else if !state.status_note.trim().is_empty() {
+        Some((state.status_note.clone(), p.muted))
+    } else if has_pending {
+        Some(("Suggestion ready".to_owned(), p.accent))
+    } else if has_fresh_grade {
+        let gap_n = state.assessment.as_ref().map_or(0, |a| a.gaps.len());
+        let gap_txt = if gap_n == 0 {
+            "Feedback ready · no gaps found".to_owned()
+        } else if gap_n == 1 {
+            "Feedback ready · 1 gap".to_owned()
+        } else {
+            format!("Feedback ready · {gap_n} gaps")
+        };
+        Some((gap_txt, p.muted))
+    } else {
+        None
+    };
+
+    if status_msg.is_some() || has_pending || has_feedback {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if busy {
+                ui.add(egui::Spinner::new().size(14.0).color(p.accent));
+            }
+            if let Some((msg, col)) = status_msg {
+                let max_w = (ui.available_width() - 190.0).max(120.0);
+                ui.allocate_ui_with_layout(vec2(max_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_max_width(max_w);
+                    ui.add(egui::Label::new(RichText::new(msg).size(12.5).color(col)).wrap());
                 });
-            });
-    }
-
-    if let Some(err) = state.error.as_deref().filter(|e| !e.trim().is_empty()) {
-        ui.add_space(10.0);
-        Frame::default()
-            .fill(blend(p.surface, p.rec, 0.12))
-            .stroke(Stroke::new(1.0_f32, blend(p.surface, p.rec, 0.55)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(12, 9))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(err).size(13.0).color(p.rec));
-            });
-    }
-
-    if let Some(cand) = &state.candidate {
-        let mut open_compare = false;
-        let mut discard_cand = false;
-
-        ui.add_space(10.0);
-        let banner_avail = ui.available_width();
-        Frame::default()
-            .fill(blend(p.surface, p.accent, 0.12))
-            .stroke(Stroke::new(1.2_f32, blend(p.line, p.accent, 0.65)))
-            .corner_radius(CornerRadius::same(12))
-            .inner_margin(Margin::symmetric(14, 11))
-            .show(ui, |ui| {
-                let inner_w = (banner_avail - 28.0).max(160.0);
-                ui.set_width(inner_w);
-                ui.set_max_width(inner_w);
-                let title = friendly_candidate_title(&cand.label);
-                let wide = inner_w >= 460.0;
-                if wide {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(RichText::new(title).size(14.0).strong().color(p.fg));
-                        if !cand.model.trim().is_empty() {
-                            widgets::badge(ui, p, &cand.model, None);
-                        }
-                        if let Some(score) = cand.assessment.as_ref().and_then(|a| a.score) {
-                            widgets::badge(ui, p, &format!("Score {score}/10"), Some(p.green));
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            if widgets::primary_btn(ui, p, "Compare suggestion →", true).clicked() {
-                                open_compare = true;
-                            }
-                            if widgets::ghost_btn(ui, p, "Discard", true).clicked() {
-                                discard_cand = true;
-                            }
-                        });
-                    });
-                } else {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-                        ui.label(RichText::new(title).size(14.0).strong().color(p.fg));
-                        if !cand.model.trim().is_empty() {
-                            widgets::badge(ui, p, &cand.model, None);
-                        }
-                        if let Some(score) = cand.assessment.as_ref().and_then(|a| a.score) {
-                            widgets::badge(ui, p, &format!("Score {score}/10"), Some(p.green));
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if widgets::primary_btn(ui, p, "Compare suggestion →", true).clicked() {
-                            open_compare = true;
-                        }
-                        if widgets::ghost_btn(ui, p, "Discard", true).clicked() {
-                            discard_cand = true;
-                        }
-                    });
-                }
-                if !cand.note.trim().is_empty() {
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::Label::new(RichText::new(&cand.note).size(12.5).color(p.muted)).wrap(),
-                    );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if has_pending {
+                    if widgets::secondary_btn(ui, p, "Compare suggestion →", true).clicked() {
+                        state.compare_open = true;
+                    }
+                    if widgets::ghost_btn(ui, p, "Discard", true).clicked() {
+                        state.compare_open = false;
+                        actions.push(UiAction::LabDiscardCandidate);
+                    }
+                } else if has_feedback {
+                    if widgets::ghost_btn(ui, p, "View feedback →", true).clicked() {
+                        state.compare_open = true;
+                    }
                 }
             });
-
-        if open_compare {
-            state.compare_open = true;
-        }
-        if discard_cand {
-            state.compare_open = false;
-            actions.push(UiAction::LabDiscardCandidate);
-        }
+        });
     }
 }
 
@@ -1155,7 +1179,7 @@ fn render_earlier_tools(
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             let can_apply = has_draft && !state.instruction.trim().is_empty() && !busy;
-            if widgets::secondary_btn(ui, p, "Apply instruction", can_apply).clicked() {
+            if widgets::secondary_btn(ui, p, "Write suggestion", can_apply).clicked() {
                 actions.push(UiAction::LabApplyInstruction(
                     state.instruction.trim().to_owned(),
                 ));
@@ -1234,15 +1258,75 @@ fn render_compare_modal(
         return;
     }
 
+    let screen = ctx.screen_rect();
+    let modal_max_h = (screen.height() - 64.0).clamp(300.0, 680.0);
+
+    // Feedback-only view (when scored without a pending suggestion — matches main's "View feedback")
     let Some(cand) = state.candidate.as_ref() else {
-        state.compare_open = false;
+        let Some(assess) = state.assessment.as_ref() else {
+            state.compare_open = false;
+            return;
+        };
+        let modal_w = (screen.width() - 48.0).clamp(320.0, 680.0);
+        let mut close_modal = false;
+        let mut trigger_refine = false;
+        egui::Window::new("Draft feedback")
+            .id(egui::Id::new("lab_feedback_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_width(modal_w)
+            .min_width(modal_w)
+            .max_width(modal_w)
+            .max_height(modal_max_h)
+            .frame(
+                Frame::default()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.2_f32, p.line))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(Margin::same(18))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 14],
+                        blur: 36,
+                        spread: 0,
+                        color: Color32::from_black_alpha(110),
+                    }),
+            )
+            .show(ctx, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("lab_feedback_modal_body")
+                    .max_height((modal_max_h - 100.0).max(160.0))
+                    .show(ui, |ui| {
+                        let inner_w = (ui.available_width() - 6.0).max(200.0);
+                        ui.set_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        render_assessment_summary(ui, p, assess, true);
+                    });
+                ui.add_space(12.0);
+                widgets::hline(ui, p);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_btn(ui, p, "Refine draft", !busy).clicked() {
+                        trigger_refine = true;
+                        close_modal = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::secondary_btn(ui, p, "Back to draft", true).clicked() {
+                            close_modal = true;
+                        }
+                    });
+                });
+            });
+        if trigger_refine {
+            actions.push(UiAction::LabEngineer);
+        }
+        if close_modal {
+            state.compare_open = false;
+        }
         return;
     };
 
-    let screen = ctx.screen_rect();
     let modal_w = (screen.width() - 48.0).clamp(320.0, 880.0);
-    let modal_max_h = (screen.height() - 64.0).clamp(300.0, 680.0);
-
     let mut close_modal = false;
     let mut show_original = state.compare_show_original;
 

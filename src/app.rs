@@ -480,14 +480,23 @@ impl ListenApp {
             format!("v{} of {}", self.lab_ui.current_rev + 1, self.lab_ui.revisions.len())
         };
 
-        // Assessment + prev_score + error
+        // Assessment + prev_score + stale + draft_pass message + error
         let mut assessment = snap.get("score").and_then(parse_assessment_view);
         if let Some(a) = assessment.as_mut() {
             a.prev_score = snap.get("prev_score").and_then(Value::as_f64).map(|n| n.round() as u32);
         }
         self.lab_ui.assessment = assessment;
+        self.lab_ui.assessment_stale = snap.get("stale").and_then(Value::as_bool).unwrap_or(false);
+        self.lab_ui.status_note = snap
+            .get("draft_pass")
+            .and_then(|v| v.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         if let Some(err) = snap.get("error").and_then(Value::as_str).filter(|s| !s.is_empty()) {
             self.lab_ui.error = Some(err.to_owned());
+        } else if !self.workspace.busy() {
+            self.lab_ui.error = None;
         }
 
         // Pending candidate ("pending": { id, source_text, kind, versions: [...] })
@@ -844,19 +853,25 @@ impl ListenApp {
                         self.lab_ui.error = Some("Finish the active recording first.".into());
                         continue;
                     }
+                    if self.lab_ui.candidate.is_some() {
+                        self.lab_ui.error = Some(
+                            "Open Compare suggestion to apply or discard the earlier suggestion before continuing.".into(),
+                        );
+                        continue;
+                    }
                     let ctx_id = self.workspace.context();
                     let text = self.lab_ui.draft.clone();
                     let settings = self.settings.clone();
-                    let (_, model) = cleanup::prompt_route(&settings, false);
-                    let try_refine = self.lab_ui.assessment.is_some();
+                    let model_name = cleanup::prompt_route(&settings, false).1.to_owned();
+                    let try_refine = self.lab_ui.assessment.is_some() && !self.lab_ui.assessment_stale;
                     let req = if try_refine {
                         self.workspace
-                            .begin_local("draft_pass", &[json!(ctx_id), json!(text), json!(true)], model, settings.prompt_target)
+                            .begin_local("draft_pass", &[json!(ctx_id), json!(text), json!(true)], &model_name, settings.prompt_target)
                             .or_else(|| {
                                 self.workspace.begin_local(
                                     "draft_pass",
                                     &[json!(ctx_id), json!(text), json!(false)],
-                                    model,
+                                    &model_name,
                                     settings.prompt_target,
                                 )
                             })
@@ -864,12 +879,18 @@ impl ListenApp {
                         self.workspace.begin_local(
                             "draft_pass",
                             &[json!(ctx_id), json!(text), json!(false)],
-                            model,
+                            &model_name,
                             settings.prompt_target,
                         )
                     };
                     if let Some(request) = req {
+                        self.lab_ui.status_note.clear();
                         self.run_workspace_stage(request, settings, false);
+                        self.lab_ui.busy_label = if try_refine {
+                            format!("Refining and scoring with {model_name}…")
+                        } else {
+                            format!("Engineering and scoring with {model_name}…")
+                        };
                     } else {
                         self.lab_ui.error = Some("Draft is empty or a Prompt Lab request is already running.".into());
                     }
