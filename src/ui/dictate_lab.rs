@@ -574,6 +574,7 @@ fn render_recent_card(
             return;
         }
 
+        let icon_map = widgets::build_app_icon_map(view.history);
         let wide_rows = ui.available_width() >= 540.0;
         for (idx, entry) in view.history.iter().rev().take(6).enumerate() {
             if idx > 0 {
@@ -584,18 +585,22 @@ fn render_recent_card(
             let text = entry.text();
             let clipped = clip_text(text, 180);
             let time = short_time(&entry.when);
+            let app_icon = entry.app_icon.as_deref().or_else(|| {
+                let key = entry.app_name.trim().to_ascii_lowercase();
+                icon_map.get(&key).copied()
+            });
 
             if wide_rows {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
+                    if !entry.app_name.trim().is_empty() {
+                        widgets::app_icon(ui, p, &entry.app_name, app_icon, 20.0);
+                    }
                     ui.label(
                         RichText::new(time)
                             .font(FontId::monospace(12.0))
                             .color(p.muted),
                     );
-                    if !entry.app_name.is_empty() {
-                        widgets::badge(ui, p, &entry.app_name, None);
-                    }
                     let text_w = (ui.available_width() - 68.0).max(80.0);
                     ui.allocate_ui(vec2(text_w, 0.0), |ui| {
                         ui.label(RichText::new(&clipped).size(14.0).color(p.fg));
@@ -609,14 +614,14 @@ fn render_recent_card(
             } else {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    if !entry.app_name.trim().is_empty() {
+                        widgets::app_icon(ui, p, &entry.app_name, app_icon, 20.0);
+                    }
                     ui.label(
                         RichText::new(time)
                             .font(FontId::monospace(12.0))
                             .color(p.muted),
                     );
-                    if !entry.app_name.is_empty() {
-                        widgets::badge(ui, p, &entry.app_name, None);
-                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::ghost_btn(ui, p, "Copy", true).clicked() {
                             actions.push(UiAction::CopyText(text.to_owned(), "Copied"));

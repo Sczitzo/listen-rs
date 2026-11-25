@@ -9,7 +9,7 @@ use crate::ui::widgets;
 use crate::ui::{HotkeyModalState, SettingsSection, SettingsUiState, UiAction, UiView};
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, ComboBox, CornerRadius, Event, FontId, Frame, Id,
-    Key, Layout, Margin, Modifiers, Order, ProgressBar, Rect, RichText, ScrollArea, Sense, Slider,
+    Key, Layout, Margin, Modifiers, Order, ProgressBar, Rect, RichText, Sense, Slider,
     Stroke, StrokeKind, TextEdit, Ui,
 };
 

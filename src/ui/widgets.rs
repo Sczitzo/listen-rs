@@ -8,11 +8,14 @@
 
 use crate::mark;
 use crate::theme::{blend, LayoutId, Palette, ThemeId};
+use base64::Engine as _;
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Margin,
-    Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+    self, pos2, vec2, Align2, Color32, ColorImage, ComboBox, CornerRadius, FontFamily, FontId,
+    Frame, Id, Margin, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Ui, Vec2,
 };
-use std::collections::VecDeque;
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
@@ -584,6 +587,110 @@ pub fn disclosure_btn(
     painter.add(Shape::convex_polygon(pts, tri_color, Stroke::NONE));
     painter.galley(pos2(rect.left() + 16.0, rect.center().y - galley.size().y * 0.5), galley, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Collect the sharpest available base64 PNG icon per lowercased app name.
+pub fn build_app_icon_map(history: &[crate::storage::HistoryEntry]) -> HashMap<String, &str> {
+    let mut map: HashMap<String, &str> = HashMap::new();
+    for entry in history {
+        let name = entry.app_name.trim();
+        let Some(icon) = entry.app_icon.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let key = name.to_ascii_lowercase();
+        let is_sharp = icon.starts_with("iVBORw0KGgoAAAANSUhEUgAAAIAAAACA");
+        match map.get(&key) {
+            None => {
+                map.insert(key, icon);
+            }
+            Some(prev) => {
+                let prev_sharp = prev.starts_with("iVBORw0KGgoAAAANSUhEUgAAAIAAAACA");
+                if is_sharp && !prev_sharp {
+                    map.insert(key, icon);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn decode_app_icon_texture(ctx: &egui::Context, icon_b64: &str) -> Option<TextureHandle> {
+    if icon_b64.is_empty() || icon_b64.len() > 36_000 || !icon_b64.starts_with("iVBORw0KGgo") {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    icon_b64.hash(&mut hasher);
+    let hash = hasher.finish();
+    let cache_id = Id::new(("listen_app_icon_tex", hash));
+
+    if let Some(cached) = ctx.data(|d| d.get_temp::<Option<TextureHandle>>(cache_id)) {
+        return cached;
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(icon_b64.trim())
+        .ok()
+        .and_then(|bytes| image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok())
+        .map(|img| {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+            ctx.load_texture(format!("app_icon_{hash:x}"), ci, TextureOptions::LINEAR)
+        });
+
+    ctx.data_mut(|d| d.insert_temp(cache_id, decoded.clone()));
+    decoded
+}
+
+/// Render a real Windows app logo PNG (cached on GPU) or a crisp rounded monogram fallback.
+/// Never renders a bordered text chip/pill — matching Listen's `.history-app` logo style.
+pub fn app_icon(
+    ui: &mut Ui,
+    p: &Palette,
+    app_name: &str,
+    icon_b64: Option<&str>,
+    size: f32,
+) -> Response {
+    let tip = if app_name.trim().is_empty() {
+        "App not recorded"
+    } else {
+        app_name.trim()
+    };
+    if let Some(tex) = icon_b64.and_then(|b64| decode_app_icon_texture(ui.ctx(), b64)) {
+        let img = egui::Image::from_texture((tex.id(), vec2(size, size)))
+            .fit_to_exact_size(vec2(size, size))
+            .corner_radius(CornerRadius::same((size * 0.22).round() as u8));
+        return ui.add(img).on_hover_text(tip);
+    }
+
+    // Crisp rounded monogram tile fallback when an older entry has no captured PNG icon
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    let painter = ui.painter();
+    let rad = (size * 0.22).round() as u8;
+    painter.rect_filled(rect, CornerRadius::same(rad), p.surface2);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(rad),
+        Stroke::new(1.0_f32, p.line),
+        StrokeKind::Inside,
+    );
+    let initial = app_name
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        initial,
+        FontId::new((size * 0.52).max(10.0), FontFamily::Name("semibold".into())),
+        p.accent,
+    );
+    resp.on_hover_text(tip)
 }
 
 /// Consistent unified dropdown combo box helper matching all Settings selects.

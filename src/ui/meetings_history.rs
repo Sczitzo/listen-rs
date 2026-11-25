@@ -6,8 +6,8 @@ use crate::theme::{blend, Palette};
 use crate::ui::widgets::{self, Icon};
 use crate::ui::{HistoryGrouping, HistoryUiState, MeetingUiState, UiAction, UiView};
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame,
-    Id, Label, Layout, Margin, Rect, Response, RichText, ScrollArea, Sense, Stroke, StrokeKind,
+    self, pos2, vec2, Align, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame,
+    Id, Label, Layout, Margin, Rect, Response, RichText, ScrollArea, Sense, Stroke,
     TextEdit, Ui,
 };
 use std::time::Duration;
@@ -407,6 +407,7 @@ pub fn render_history(
         });
     } else {
         // Group ALL matched entries first so the Jump-to timeline covers every single day/app
+        let icon_map = widgets::build_app_icon_map(view.history);
         let groups = group_entries(&matched, state.grouping);
         let mut group_starts: Vec<usize> = Vec::with_capacity(groups.len());
         let mut running = 0usize;
@@ -431,13 +432,22 @@ pub fn render_history(
                 ui.allocate_ui_with_layout(vec2(rail_w, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(rail_w);
                     ui.set_max_width(rail_w);
-                    render_jump_rail(ui, p, &groups, &group_starts, state, rail_w);
+                    render_jump_rail(ui, p, &groups, &group_starts, &icon_map, state, rail_w);
                 });
                 // Right history entries column
                 ui.allocate_ui_with_layout(vec2(list_w, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(list_w);
                     ui.set_max_width(list_w);
-                    render_history_groups_column(ui, p, &groups, &group_starts, total_matches, state, actions);
+                    render_history_groups_column(
+                        ui,
+                        p,
+                        &groups,
+                        &group_starts,
+                        &icon_map,
+                        total_matches,
+                        state,
+                        actions,
+                    );
                 });
             });
         } else {
@@ -445,7 +455,16 @@ pub fn render_history(
                 render_compact_jump_bar(ui, p, &groups, &group_starts, state);
                 ui.add_space(10.0);
             }
-            render_history_groups_column(ui, p, &groups, &group_starts, total_matches, state, actions);
+            render_history_groups_column(
+                ui,
+                p,
+                &groups,
+                &group_starts,
+                &icon_map,
+                total_matches,
+                state,
+                actions,
+            );
         }
     }
 
@@ -485,6 +504,7 @@ fn render_jump_rail(
     p: &Palette,
     groups: &[(&str, Vec<&HistoryEntry>)],
     group_starts: &[usize],
+    icon_map: &std::collections::HashMap<String, &str>,
     state: &mut HistoryUiState,
     rail_w: f32,
 ) {
@@ -518,32 +538,46 @@ fn render_jump_rail(
                         };
                         let count_str = format_count(entries.len());
                         let (rect, resp) = ui.allocate_exact_size(vec2(row_w, 26.0), Sense::click());
-                        let painter = ui.painter();
-                        let fill = if active {
-                            blend(p.surface, p.accent, 0.16)
-                        } else if resp.hovered() {
-                            p.surface2
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        if fill != Color32::TRANSPARENT {
-                            painter.rect_filled(rect, CornerRadius::same(7), fill);
+                        {
+                            let painter = ui.painter();
+                            let fill = if active {
+                                blend(p.surface, p.accent, 0.16)
+                            } else if resp.hovered() {
+                                p.surface2
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            if fill != Color32::TRANSPARENT {
+                                painter.rect_filled(rect, CornerRadius::same(7), fill);
+                            }
+                            if active {
+                                painter.rect_filled(
+                                    Rect::from_min_size(pos2(rect.left() + 2.0, rect.top() + 5.0), vec2(2.5, rect.height() - 10.0)),
+                                    CornerRadius::same(2),
+                                    p.accent,
+                                );
+                            }
                         }
-                        if active {
-                            painter.rect_filled(
-                                Rect::from_min_size(pos2(rect.left() + 2.0, rect.top() + 5.0), vec2(2.5, rect.height() - 10.0)),
-                                CornerRadius::same(2),
-                                p.accent,
+                        let mut text_left = rect.left() + 9.0;
+                        if state.grouping == HistoryGrouping::App && *key != "Unknown app" {
+                            let icon_b64 = icon_map.get(&key.to_ascii_lowercase()).copied();
+                            let icon_rect = Rect::from_min_size(
+                                pos2(rect.left() + 8.0, rect.center().y - 7.5),
+                                vec2(15.0, 15.0),
                             );
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(icon_rect), |ui| {
+                                widgets::app_icon(ui, p, key, icon_b64, 15.0);
+                            });
+                            text_left = rect.left() + 28.0;
                         }
+                        let painter = ui.painter();
                         let lbl_col = if active || resp.hovered() { p.fg } else { p.muted };
                         let count_gal = painter.layout_no_wrap(count_str, FontId::proportional(11.0), p.faint);
-                        let max_lbl_w = (rect.width() - count_gal.size().x - 18.0).max(30.0);
-                        let truncated = truncate_label(&short_lbl, 16);
+                        let max_chars = if state.grouping == HistoryGrouping::App { 11 } else { 15 };
+                        let truncated = truncate_label(&short_lbl, max_chars);
                         let lbl_gal = painter.layout_no_wrap(truncated, FontId::proportional(12.0), lbl_col);
-                        let _ = max_lbl_w;
                         painter.galley(
-                            pos2(rect.left() + 9.0, rect.center().y - lbl_gal.size().y * 0.5),
+                            pos2(text_left, rect.center().y - lbl_gal.size().y * 0.5),
                             lbl_gal,
                             lbl_col,
                         );
@@ -622,6 +656,7 @@ fn render_history_groups_column(
     p: &Palette,
     groups: &[(&str, Vec<&HistoryEntry>)],
     group_starts: &[usize],
+    icon_map: &std::collections::HashMap<String, &str>,
     total_matches: usize,
     state: &mut HistoryUiState,
     actions: &mut Vec<UiAction>,
@@ -641,7 +676,7 @@ fn render_history_groups_column(
     ui.label(RichText::new(summary).size(12.0).color(p.faint));
     ui.add_space(6.0);
 
-    let mut rendered_entries = 0usize;
+    let by_app = state.grouping == HistoryGrouping::App;
     for (group_idx, (key, entries)) in groups.iter().enumerate() {
         let start = group_starts[group_idx];
         if start >= state.display_limit {
@@ -656,13 +691,31 @@ fn render_history_groups_column(
             ui.add_space(10.0);
         }
 
-        let heading = match state.grouping {
-            HistoryGrouping::Day => format_day_heading(key),
-            HistoryGrouping::App => (*key).to_owned(),
+        let heading = if by_app {
+            (*key).to_owned()
+        } else {
+            format_day_heading(key)
         };
         let is_open = !state.collapsed_groups.contains(*key);
         let header_resp = ui.horizontal(|ui| {
-            let toggle = widgets::disclosure_btn(ui, p, &heading, is_open, 13.5, true, p.fg);
+            let toggle = if by_app && *key != "Unknown app" {
+                let icon_b64 = icon_map.get(&key.to_ascii_lowercase()).copied();
+                let tri = widgets::disclosure_btn(ui, p, "", is_open, 13.5, true, p.fg);
+                widgets::app_icon(ui, p, key, icon_b64, 20.0);
+                let lbl = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(&heading)
+                                .font(FontId::new(13.5, FontFamily::Name("semibold".into())))
+                                .color(p.fg),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                tri.union(lbl)
+            } else {
+                widgets::disclosure_btn(ui, p, &heading, is_open, 13.5, true, p.fg)
+            };
             if toggle.clicked() {
                 if is_open {
                     state.collapsed_groups.insert((*key).to_owned());
@@ -689,15 +742,51 @@ fn render_history_groups_column(
 
         if is_open {
             ui.add_space(6.0);
+            let rail_x = ui.cursor().left() + 7.0;
+            let track_top = ui.cursor().top() + 18.0;
+            let mut dot_positions: Vec<(f32, Color32)> = Vec::with_capacity(slice.len());
+
             for (entry_idx, entry) in slice.iter().enumerate() {
-                ui.push_id((group_idx, entry.unix, entry_idx), |ui| {
-                    render_history_entry_card(ui, p, entry, &mut state.open_ids, actions);
+                let card_top = ui.cursor().top();
+                let dot_color = outcome_tint(p, &entry.outcome).unwrap_or(p.accent);
+                dot_positions.push((card_top + 22.0, dot_color));
+                ui.horizontal_top(|ui| {
+                    ui.add_space(18.0);
+                    let card_w = ui.available_width().max(180.0);
+                    ui.allocate_ui_with_layout(vec2(card_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(card_w);
+                        ui.set_max_width(card_w);
+                        ui.push_id((group_idx, entry.unix, entry_idx), |ui| {
+                            render_history_entry_card(
+                                ui,
+                                p,
+                                entry,
+                                icon_map,
+                                !by_app,
+                                by_app,
+                                &mut state.open_ids,
+                                actions,
+                            );
+                        });
+                    });
                 });
                 ui.add_space(8.0);
-                rendered_entries += 1;
             }
-        } else {
-            rendered_entries += slice.len();
+
+            // Paint the vertical timeline rail and colored node dots
+            if let Some(&(last_y, _)) = dot_positions.last() {
+                let painter = ui.painter();
+                if dot_positions.len() > 1 {
+                    painter.line_segment(
+                        [pos2(rail_x, track_top), pos2(rail_x, last_y)],
+                        Stroke::new(1.5_f32, p.line),
+                    );
+                }
+                for (cy, col) in dot_positions {
+                    painter.circle_filled(pos2(rail_x, cy), 5.5, p.bg);
+                    painter.circle_filled(pos2(rail_x, cy), 3.6, col);
+                }
+            }
         }
     }
 
@@ -722,7 +811,6 @@ fn render_history_groups_column(
             }
         });
     }
-    let _ = rendered_entries;
 }
 
 fn render_kpi_strip(ui: &mut Ui, p: &Palette, view: &UiView<'_>) {
@@ -896,10 +984,14 @@ fn render_history_tools_row(ui: &mut Ui, p: &Palette, state: &mut HistoryUiState
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_history_entry_card(
     ui: &mut Ui,
     p: &Palette,
     entry: &HistoryEntry,
+    icon_map: &std::collections::HashMap<String, &str>,
+    show_app: bool,
+    show_short_date: bool,
     open_ids: &mut std::collections::HashSet<u64>,
     actions: &mut Vec<UiAction>,
 ) {
@@ -911,20 +1003,40 @@ fn render_history_entry_card(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            // Top metadata line: time (HH:MM), app badge, duration, outcome badge
-            ui.horizontal_wrapped(|ui| {
-                let time_str = extract_time_hhmm(&entry.when);
+            // Top metadata line: real Windows app logo + clean inline name (no chip), time, duration, outcome
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let app = entry.app_name.trim();
+                if show_app && !app.is_empty() {
+                    let app_icon = entry.app_icon.as_deref().or_else(|| {
+                        let k = app.to_ascii_lowercase();
+                        icon_map.get(&k).copied()
+                    });
+                    widgets::app_icon(ui, p, app, app_icon, 22.0);
+                    ui.label(
+                        RichText::new(app)
+                            .font(FontId::new(13.0, FontFamily::Name("semibold".into())))
+                            .color(p.fg),
+                    );
+                }
+
+                let time_str = if show_short_date {
+                    let day = entry.when.get(..10).map(format_day_short).unwrap_or_default();
+                    let hhmm = extract_time_hhmm(&entry.when);
+                    if day.is_empty() {
+                        hhmm.to_owned()
+                    } else {
+                        format!("{day} {hhmm}")
+                    }
+                } else {
+                    extract_time_hhmm(&entry.when).to_owned()
+                };
                 if !time_str.is_empty() {
                     ui.label(
                         RichText::new(time_str)
                             .font(FontId::monospace(12.0))
                             .color(p.faint),
                     );
-                }
-
-                let app = entry.app_name.trim();
-                if !app.is_empty() {
-                    widgets::badge(ui, p, app, None);
                 }
 
                 if entry.seconds > 0.0 {
