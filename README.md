@@ -13,7 +13,7 @@
 
 <br />
 
-<img src="docs/images/hero-dictate.png" alt="Listen native Rust voice dictation app for Windows showing live provisional transcript, Right Ctrl push-to-talk hotkey, 98ms cold readiness, 65.8MB footprint, and Warm Charcoal theme" width="100%" />
+<img src="docs/images/hero-dictate.png" alt="Listen native Rust voice dictation app for Windows in Midnight theme showing custom Ctrl + Right Arrow hotkey, adaptive vocabulary suggestions, 98ms cold readiness, and 65.8MB native footprint" width="100%" />
 
 </div>
 
