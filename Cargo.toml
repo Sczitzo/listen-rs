@@ -1,0 +1,64 @@
+[package]
+name = "listen-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sczitzo"]
+description = "Fast, private, local push-to-talk voice dictation, command mode, and meeting notetaker for Windows — native Rust rebuild of Listen."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Sczitzo/listen-rs"
+homepage = "https://github.com/Sczitzo/listen-rs"
+keywords = ["dictation", "speech-to-text", "whisper", "parakeet", "windows"]
+categories = ["multimedia::audio", "accessibility", "text-processing"]
+
+[[bin]]
+name = "listen-rs"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+arboard = "3"
+libloading = "0.8"
+regex = "=1.13.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+tray-icon = "0.19"
+raw-window-handle = "0.6"
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[target.'cfg(windows)'.build-dependencies]
+find-msvc-tools = "0.1.15"
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "=5.4.3"
+wry = { version = "=0.57.3", default-features = false }
+webview2-com = "=0.39.1"
+windows = { version = "=0.62.2", features = ["Win32_System_Com_StructuredStorage"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_XboxController",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

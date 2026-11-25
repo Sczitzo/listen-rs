@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+
+# Packaged binaries, local speech runtimes, and downloaded model weights
+/dist/
+*.exe
+*.dll
+*.gguf
+*.bin
+*.zip
+
+# Local screenshots, verification profiles, and logs
+/shots/
+*.profile/
+*.log
+/mechanics-*-report.json
+
+# AI / editor / OS scratch files
+/.ai-context/
+/.impeccable/
+/.vscode/
+/.idea/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

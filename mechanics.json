@@ -1,0 +1,786 @@
+{
+  "version": 1,
+  "values": [
+    {
+      "name": "color.bg",
+      "group": "theme.warm",
+      "value": "#211f1d",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.surface",
+      "group": "theme.warm",
+      "value": "#2d2925",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.surface2",
+      "group": "theme.warm",
+      "value": "#3b342d",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.line",
+      "group": "theme.warm",
+      "value": "#a49380",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.fg",
+      "group": "theme.warm",
+      "value": "#f1e9dd",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.muted",
+      "group": "theme.warm",
+      "value": "#c8bdaf",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.faint",
+      "group": "theme.warm",
+      "value": "#b9ab9b",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.accent",
+      "group": "theme.warm",
+      "value": "#dcc09a",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.accent_fg",
+      "group": "theme.warm",
+      "value": "#282117",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.nav",
+      "group": "theme.warm",
+      "value": "#1b1a18",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.rec",
+      "group": "theme.warm",
+      "value": "#FF8589",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.amber",
+      "group": "theme.warm",
+      "value": "#F5A524",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.green",
+      "group": "theme.warm",
+      "value": "#4ADE80",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "color.blue",
+      "group": "theme.warm",
+      "value": "#5B8CFF",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "radius.small",
+      "group": "layout",
+      "value": 8,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "radius.large",
+      "group": "layout",
+      "value": 12,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "font.body",
+      "group": "layout",
+      "value": 15,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "font.h1",
+      "group": "layout",
+      "value": 29,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "top_rail.height",
+      "group": "layout",
+      "value": 64,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "chip.height",
+      "group": "layout",
+      "value": 28,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "button.height",
+      "group": "layout",
+      "value": 32,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "meter.bar_width",
+      "group": "meter",
+      "value": 3,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "meter.bar_gap",
+      "group": "meter",
+      "value": 3,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "meter.height",
+      "group": "meter",
+      "value": 28,
+      "unit": "px",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "page.fade",
+      "group": "motion",
+      "value": 0.18,
+      "unit": "s",
+      "source": "ev_d04fdcdac1ed36f64595f3e1a4599077478b89b52153ffafdf3da240ad2b8e92"
+    },
+    {
+      "name": "speech.chunk_max",
+      "group": "speech",
+      "value": 20,
+      "unit": "s",
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.cut_search_min_offset",
+      "group": "speech",
+      "value": 15,
+      "unit": "s",
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.cut_search_tail",
+      "group": "speech",
+      "value": 3,
+      "unit": "s",
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.cut_window",
+      "group": "speech",
+      "value": 1600,
+      "unit": "samples",
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.cut_offset",
+      "group": "speech",
+      "value": 800,
+      "unit": "samples",
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.silent_chunk_rms",
+      "group": "speech",
+      "value": 0.0001,
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.threads",
+      "group": "speech",
+      "value": 4,
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.backend",
+      "group": "speech",
+      "value": 1,
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.runtime_version",
+      "group": "speech",
+      "value": "0.4.2",
+      "source": "ev_bf57a02251e8636e0db1b4887386c43fb838a8560b67a12478ddc6826dcfb46c"
+    },
+    {
+      "name": "speech.sample_rate",
+      "group": "speech",
+      "value": 16000,
+      "unit": "Hz",
+      "estimated": true
+    },
+    {
+      "name": "recording.max_length",
+      "group": "recording",
+      "value": 600,
+      "unit": "s",
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "recording.start_chime",
+      "group": "recording",
+      "value": 0.15,
+      "unit": "s",
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "recording.no_audio_error_after",
+      "group": "recording",
+      "value": 0.5,
+      "unit": "s",
+      "source": "Listen-source-11f575d.zip:dictate.py:1944-1949"
+    },
+    {
+      "name": "hotkey.tap_lock",
+      "group": "input",
+      "value": 0.3,
+      "unit": "s",
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "recording.silence_rms",
+      "group": "recording",
+      "value": 0.004,
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "cleanup.num_ctx",
+      "group": "cleanup",
+      "value": 8192,
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "cleanup.timeout",
+      "group": "cleanup",
+      "value": 15,
+      "unit": "s",
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "cleanup.keep_alive",
+      "group": "cleanup",
+      "value": "5m",
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "hotkey.default",
+      "group": "input",
+      "value": "Right Ctrl (hold)",
+      "source": "ev_1795413c263107d76d4d9d8e1a60d50315babfe64a10e5ffccc7bb92a8ff5faf"
+    },
+    {
+      "name": "cleanup.ollama_url",
+      "group": "cleanup",
+      "value": "http://127.0.0.1:11434",
+      "estimated": true
+    },
+    {
+      "name": "window.size",
+      "group": "layout",
+      "value": "900x700",
+      "unit": "pt",
+      "source": "main.rs default and original create_window; observed source"
+    },
+    {
+      "name": "window.size_compact",
+      "group": "layout",
+      "value": "480x760",
+      "unit": "px",
+      "estimated": true
+    },
+    {
+      "name": "themes.count",
+      "group": "theme",
+      "value": 5,
+      "estimated": true
+    },
+    {
+      "name": "layouts.count",
+      "group": "layout",
+      "value": 4,
+      "estimated": true
+    },
+    {
+      "name": "dll.model_params.size",
+      "group": "speech.dll",
+      "value": 32,
+      "unit": "bytes",
+      "address": "0x180014a60",
+      "source": "ev_27335c9b303b0039f9e48b9db58e0d9c7a1160773dbfe9d7e37640bf9c475278"
+    },
+    {
+      "name": "dll.model_params.min_size",
+      "group": "speech.dll",
+      "value": 24,
+      "unit": "bytes",
+      "address": "0x180012fc0",
+      "source": "ev_57c080d07b7163049247d4e3f72d3df341e556da11544560c48a833678480e6d"
+    },
+    {
+      "name": "dll.model_params.backend_offset",
+      "group": "speech.dll",
+      "value": 8,
+      "unit": "bytes",
+      "address": "0x180012fc0",
+      "source": "ev_57c080d07b7163049247d4e3f72d3df341e556da11544560c48a833678480e6d"
+    },
+    {
+      "name": "dll.model_params.backend_max",
+      "group": "speech.dll",
+      "value": 6,
+      "address": "0x180012fc0",
+      "source": "ev_57c080d07b7163049247d4e3f72d3df341e556da11544560c48a833678480e6d"
+    },
+    {
+      "name": "dll.status.params_too_small",
+      "group": "speech.dll",
+      "value": 14,
+      "address": "0x180012fc0",
+      "source": "ev_57c080d07b7163049247d4e3f72d3df341e556da11544560c48a833678480e6d"
+    },
+    {
+      "name": "dll.session_params.size",
+      "group": "speech.dll",
+      "value": 24,
+      "unit": "bytes",
+      "address": "0x180014ce0",
+      "source": "ev_27335c9b303b0039f9e48b9db58e0d9c7a1160773dbfe9d7e37640bf9c475278"
+    },
+    {
+      "name": "dll.run_params.size",
+      "group": "speech.dll",
+      "value": 104,
+      "unit": "bytes",
+      "address": "0x18001c090",
+      "source": "ev_cefb09be685615c69668aaf0d5379ce7291370adef6236fd3cda439d6194cf4b"
+    },
+    {
+      "name": "dll.run_params.timestamps_offset",
+      "group": "speech.dll",
+      "value": 12,
+      "unit": "bytes",
+      "source": "transcribe.cpp v0.4.2 include/transcribe.h:1172-1188 (Windows x64 layout)"
+    },
+    {
+      "name": "dll.run_params.timestamps_default",
+      "group": "speech.dll",
+      "value": 1,
+      "source": "bundled transcribe.dll v0.4.2 transcribe_run_params_init"
+    },
+    {
+      "name": "dll.run_params.spec_k_drafts_offset",
+      "group": "speech.dll",
+      "value": 64,
+      "unit": "bytes",
+      "source": "transcribe.cpp v0.4.2 include/transcribe.h:1172-1188 (Windows x64 layout)"
+    },
+    {
+      "name": "dll.run_params.spec_k_drafts_default",
+      "group": "speech.dll",
+      "value": -1,
+      "source": "bundled transcribe.dll v0.4.2 transcribe_run_params_init"
+    },
+    {
+      "name": "dll.run.rejects_non_finite_samples",
+      "group": "speech.dll",
+      "value": true,
+      "address": "0x180018840",
+      "source": "ev_92ac329135488dd50785e1ceaaba84e6c0b233ed1b44512b4413738e0927169d"
+    },
+    {
+      "name": "dll.run.non_finite_status",
+      "group": "speech.dll",
+      "value": 1,
+      "address": "0x1800161b0",
+      "source": "ev_cefb09be685615c69668aaf0d5379ce7291370adef6236fd3cda439d6194cf4b"
+    },
+    {
+      "name": "dll.full_text.never_null",
+      "group": "speech.dll",
+      "value": true,
+      "address": "0x18001b670",
+      "source": "ev_27335c9b303b0039f9e48b9db58e0d9c7a1160773dbfe9d7e37640bf9c475278"
+    },
+    {
+      "name": "dll.status_codes",
+      "group": "speech.dll",
+      "value": 22,
+      "unit": "count",
+      "source": "function 0x180014bb0, ev_faeef3ca; export called directly with codes 0 through 21"
+    },
+    {
+      "name": "dll.exports",
+      "group": "speech.dll",
+      "value": 147,
+      "source": "ev_5a35a69e7a8c37a8614708ff64d489c993f9c7fc6b0080e1abf8ef853267dbf8"
+    },
+    {
+      "name": "live.card_width_px",
+      "group": "live_preview",
+      "value": 380,
+      "unit": "px",
+      "source": "Original preview_card.py:15; rebuild lantern.rs WIDTH"
+    },
+    {
+      "name": "live.interval_s",
+      "group": "live_preview",
+      "value": 1.5,
+      "original": 3.0,
+      "note": "deliberately faster; waits at least 2x the last run",
+      "source": "fnd_6"
+    },
+    {
+      "name": "live.min_audio_s",
+      "group": "live_preview",
+      "value": 2.0,
+      "unit": "s",
+      "source": "fnd_6"
+    },
+    {
+      "name": "live.piece_s",
+      "group": "live_preview",
+      "value": 8.0,
+      "unit": "s",
+      "source": "fnd_6"
+    },
+    {
+      "name": "ui.window_width_pt",
+      "group": "window",
+      "value": 900,
+      "unit": "pt",
+      "source": "dictate.py:3257 create_window width=900"
+    },
+    {
+      "name": "ui.window_height_pt",
+      "group": "window",
+      "value": 700,
+      "unit": "pt",
+      "source": "dictate.py:3257 create_window height=700"
+    },
+    {
+      "name": "ui.screenshot_window_pt",
+      "group": "window",
+      "value": "812x800",
+      "unit": "pt",
+      "estimated": true
+    },
+    {
+      "name": "ui.transcript_title",
+      "group": "live_preview",
+      "value": "Recording transcript · provisional",
+      "source": "ui/index.html:76"
+    },
+    {
+      "name": "ui.rail_height_px",
+      "group": "look",
+      "value": 64,
+      "unit": "px",
+      "source": "ui/app.css .rail"
+    },
+    {
+      "name": "ui.rail_padding_px",
+      "group": "look",
+      "value": 27,
+      "unit": "px",
+      "source": "ui/app.css:35"
+    },
+    {
+      "name": "ui.rail_button_min_height_px",
+      "group": "look",
+      "value": 38,
+      "unit": "px",
+      "source": "ui/app.css:38"
+    },
+    {
+      "name": "ui.brand_name_px",
+      "group": "look",
+      "value": 21,
+      "unit": "px",
+      "source": "ui/app.css brand"
+    },
+    {
+      "name": "ui.page_title_px",
+      "group": "look",
+      "value": 29,
+      "unit": "px",
+      "source": "ui/app.css page h1"
+    },
+    {
+      "name": "ui.hero_bars_width_px",
+      "group": "look",
+      "value": 96,
+      "unit": "px",
+      "source": "ui/index.html hero-bars"
+    },
+    {
+      "name": "ui.dictate_sections",
+      "group": "look",
+      "value": "hotkey + status | Recording transcript while active | Vocabulary | collapsible Recent",
+      "unit": "order",
+      "source": "Listen 19 ui/index.html; ev_d2ccd44f release receipt"
+    },
+    {
+      "name": "ui.vocab_suggestions",
+      "group": "look",
+      "value": "up to eight from saved transcripts",
+      "unit": "words",
+      "source": "Original dictate.py suggest_vocab; rebuild storage.rs and settings_bridge.rs"
+    },
+    {
+      "name": "live.outcome_texts",
+      "group": "live_preview",
+      "value": "Paste confirmed | Check the original app first | Open Listen to recover text | Review in Listen | No speech heard | Processing failed | Recording discarded",
+      "unit": "labels",
+      "source": "Rebuild engine.rs; original delivery states in dictate.py"
+    },
+    {
+      "name": "tray.tooltip",
+      "group": "tray",
+      "value": "Listen: {status}",
+      "source": "dictate.py 2400-2402"
+    },
+    {
+      "name": "tray.menu",
+      "group": "tray",
+      "value": "Open Listen | Prompt Lab | Copy favourite > name  (uses) | Settings | Quit",
+      "note": "Prompt Lab, Settings and submenu label are the rebuild's; original lines 3134-3140 unread",
+      "estimated": true
+    },
+    {
+      "name": "tray.close_button",
+      "group": "tray",
+      "value": "hides window (parked off-screen, off taskbar); Quit exits",
+      "source": "measured: LISTEN_HIDE_TEST frames 90 in 3 s"
+    },
+    {
+      "name": "icon.tile_outline",
+      "group": "icon",
+      "value": "#FFF4E8",
+      "source": "dictate.py 2288 (255,244,232)"
+    },
+    {
+      "name": "icon.tile_outline_alpha",
+      "group": "icon",
+      "value": 46,
+      "source": "dictate.py 2288"
+    },
+    {
+      "name": "icon.wave_fill",
+      "group": "icon",
+      "value": "#F0EDE8",
+      "source": "dictate.py 2292 (240,237,232)"
+    },
+    {
+      "name": "chime.copied_hz",
+      "group": "audio",
+      "value": 880,
+      "unit": "Hz",
+      "source": "dictate.py:784, ev_7ebedf21"
+    },
+    {
+      "name": "chime.copied_length",
+      "group": "audio",
+      "value": 0.09,
+      "unit": "s",
+      "source": "dictate.py:788, ev_7ebedf21"
+    },
+    {
+      "name": "package.runtime",
+      "group": "packaging",
+      "value": "dist/Listen/runtime/transcribe-0.4.2-cpu-vulkan",
+      "source": "package.bat"
+    },
+    {
+      "name": "package.model",
+      "group": "packaging",
+      "value": "dist/Listen/models/parakeet-unified-en-0.6b-Q8_0.gguf",
+      "note": "HF snapshot 7e948f21b7bdbac698d3318db9d350f1096f3b6c",
+      "source": "parakeet_runtime.py 17-23"
+    },
+    {
+      "name": "ui.card",
+      "group": "ui",
+      "value": "surface fill, 1px line border, radius 12, padding 14x16",
+      "source": "app.css 74 (.card)"
+    },
+    {
+      "name": "vocab.suggest_limit",
+      "group": "vocabulary",
+      "value": 8,
+      "source": "dictate.py 331 suggest_vocab(limit=8)"
+    },
+    {
+      "name": "vocab.suggest_min_count",
+      "group": "vocabulary",
+      "value": 2,
+      "note": "capitalised mid-sentence words, minus _STOP, known and dismissed",
+      "source": "dictate.py 325-346"
+    },
+    {
+      "name": "vocab.dismissed",
+      "group": "vocabulary",
+      "value": "settings.vocab_dismissed",
+      "note": "original keeps it in learned.json 'dismissed'; hand-correction suggestions not rebuilt",
+      "source": "dictate.py 2628-2645"
+    },
+    {
+      "name": "live.card_anchor",
+      "group": "live_preview",
+      "value": "centered above the bottom of target work area",
+      "unit": "position",
+      "source": "Original preview_card.py place_card and overlay layout; rebuild lantern.rs"
+    },
+    {
+      "name": "chime.start_notes",
+      "group": "audio",
+      "value": "660, 880",
+      "unit": "Hz",
+      "source": "dictate.py:783, ev_7ebedf21"
+    },
+    {
+      "name": "chime.stop_notes",
+      "group": "audio",
+      "value": "880, 660",
+      "unit": "Hz",
+      "source": "dictate.py:783, ev_7ebedf21"
+    },
+    {
+      "name": "chime.cancel_note",
+      "group": "audio",
+      "value": 440,
+      "unit": "Hz",
+      "source": "dictate.py:783, ev_7ebedf21"
+    },
+    {
+      "name": "chime.error_notes",
+      "group": "audio",
+      "value": "330, 330",
+      "unit": "Hz",
+      "source": "dictate.py:784, ev_7ebedf21"
+    },
+    {
+      "name": "history.save_before_send",
+      "group": "delivery",
+      "value": "append History before send; require original focused Windows target",
+      "unit": "rule",
+      "source": "app/src/engine.rs save_and_deliver_using; original safety decision for Rust candidate"
+    },
+    {
+      "name": "typing.max_units",
+      "group": "delivery",
+      "value": 4096,
+      "unit": "UTF-16 units",
+      "source": "app/src/winput.rs deliver_with_focus"
+    },
+    {
+      "name": "typing.multiline",
+      "group": "delivery",
+      "value": "one standard Edit replacement with exact readback; other fields keep it for manual paste",
+      "unit": "rule",
+      "source": "app/src/multiline.rs deliver and app/src/winput.rs"
+    },
+    {
+      "name": "dll.run_params.minimum_size",
+      "group": "speech.dll",
+      "value": 68,
+      "unit": "bytes",
+      "source": "function 0x180018ca0, ev_c5157e1d"
+    },
+    {
+      "name": "dll.run_params.null_uses_defaults",
+      "group": "speech.dll",
+      "value": true,
+      "unit": "rule",
+      "source": "function 0x180018ca0, ev_c5157e1d"
+    },
+    {
+      "name": "shortcut.lease",
+      "group": "input",
+      "value": 60,
+      "unit": "s",
+      "source": "app/src/app.rs hotkey_call"
+    },
+    {
+      "name": "shortcut.registration_target",
+      "group": "input",
+      "value": "same Windows event tick and registration; missing match goes to manual recovery",
+      "unit": "rule",
+      "source": "Original dictate.py _registered_hotkey_edge; app/src/winput.rs matching_target"
+    },
+    {
+      "name": "controller.digital_choices",
+      "group": "input",
+      "value": 14,
+      "unit": "buttons",
+      "source": "Original controller_hotkey.py _BUTTONS; app/src/controller.rs"
+    },
+    {
+      "name": "controller.connected_limit",
+      "group": "input",
+      "value": 1,
+      "unit": "controllers",
+      "source": "Original controller_hotkey.py gesture; app/src/controller.rs Gesture"
+    },
+    {
+      "name": "history.dest_name_limit",
+      "group": "history",
+      "value": 80,
+      "unit": "characters",
+      "source": "Original target_icon.py history_app; app/src/winput.rs app_label"
+    },
+    {
+      "name": "history.icon_size",
+      "group": "history",
+      "value": 128,
+      "unit": "px",
+      "source": "Original target_icon.py high-resolution icon source; app/src/history_icon.rs SIZE"
+    },
+    {
+      "name": "history.digit_roll",
+      "group": "ui",
+      "value": 1.5,
+      "unit": "s",
+      "source": "Original ui/app.js historyMetric; rebuild uses the same screen"
+    },
+    {
+      "name": "status.slow_speech",
+      "group": "window",
+      "value": 15,
+      "unit": "s",
+      "source": "Original ui/app.js setStatus; rebuild uses the same screen"
+    },
+    {
+      "name": "status.slow_connection",
+      "group": "window",
+      "value": 5,
+      "unit": "s",
+      "source": "Original ui/app.js watchConnection; rebuild uses the same screen"
+    },
+    {
+      "name": "screenshot.frames",
+      "group": "window",
+      "value": 120,
+      "unit": "frames",
+      "source": "app/src/app.rs screenshot_step"
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows-test-and-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check UI JavaScript syntax
+        run: |
+          node --check ui/app.js
+          node --check ui/model-benchmarks.js
+
+      - name: Run unit tests (101+ tests including WCAG AA contrast & formatting safety)
+        run: cargo test --locked
+
+      - name: Build Windows release binary
+        run: cargo build --release --locked
