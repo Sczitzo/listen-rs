@@ -947,13 +947,16 @@ fn render_draft_card(
                 || !assess.criteria.is_empty()
             {
                 ui.add_space(10.0);
+                let score_avail = ui.available_width();
                 Frame::default()
                     .fill(p.surface2)
                     .stroke(Stroke::new(1.0_f32, p.line_faint()))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                        let inner_w = (score_avail - 24.0).max(160.0);
+                        ui.set_width(inner_w);
+                        ui.set_max_width(inner_w);
                         render_assessment_summary(ui, p, assess, true);
                     });
             }
@@ -1047,31 +1050,51 @@ fn render_lab_status_bars(
         let mut discard_cand = false;
 
         ui.add_space(10.0);
+        let banner_avail = ui.available_width();
         Frame::default()
             .fill(blend(p.surface, p.accent, 0.12))
             .stroke(Stroke::new(1.2_f32, blend(p.line, p.accent, 0.65)))
             .corner_radius(CornerRadius::same(12))
             .inner_margin(Margin::symmetric(14, 11))
             .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-                    let title = if cand.label.trim().is_empty() {
-                        "Suggestion ready"
-                    } else {
-                        cand.label.as_str()
-                    };
-                    ui.label(RichText::new(title).size(14.0).strong().color(p.fg));
-                    if !cand.model.trim().is_empty() {
-                        widgets::badge(ui, p, &cand.model, None);
-                    }
-                    if let Some(score) = cand.assessment.as_ref().and_then(|a| a.score) {
-                        widgets::badge(ui, p, &format!("Score {score}/10"), Some(p.green));
-                    }
-                    if !cand.note.trim().is_empty() {
-                        ui.label(RichText::new(&cand.note).size(12.5).color(p.muted));
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let inner_w = (banner_avail - 28.0).max(160.0);
+                ui.set_width(inner_w);
+                ui.set_max_width(inner_w);
+                let title = friendly_candidate_title(&cand.label);
+                let wide = inner_w >= 460.0;
+                if wide {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new(title).size(14.0).strong().color(p.fg));
+                        if !cand.model.trim().is_empty() {
+                            widgets::badge(ui, p, &cand.model, None);
+                        }
+                        if let Some(score) = cand.assessment.as_ref().and_then(|a| a.score) {
+                            widgets::badge(ui, p, &format!("Score {score}/10"), Some(p.green));
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if widgets::primary_btn(ui, p, "Compare suggestion →", true).clicked() {
+                                open_compare = true;
+                            }
+                            if widgets::ghost_btn(ui, p, "Discard", true).clicked() {
+                                discard_cand = true;
+                            }
+                        });
+                    });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+                        ui.label(RichText::new(title).size(14.0).strong().color(p.fg));
+                        if !cand.model.trim().is_empty() {
+                            widgets::badge(ui, p, &cand.model, None);
+                        }
+                        if let Some(score) = cand.assessment.as_ref().and_then(|a| a.score) {
+                            widgets::badge(ui, p, &format!("Score {score}/10"), Some(p.green));
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
                         if widgets::primary_btn(ui, p, "Compare suggestion →", true).clicked() {
                             open_compare = true;
                         }
@@ -1079,7 +1102,13 @@ fn render_lab_status_bars(
                             discard_cand = true;
                         }
                     });
-                });
+                }
+                if !cand.note.trim().is_empty() {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(&cand.note).size(12.5).color(p.muted)).wrap(),
+                    );
+                }
             });
 
         if open_compare {
@@ -1243,11 +1272,7 @@ fn render_compare_modal(
             // Top context strip.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-                let title = if cand.label.trim().is_empty() {
-                    "Suggested revision"
-                } else {
-                    cand.label.as_str()
-                };
+                let title = friendly_candidate_title(&cand.label);
                 ui.label(RichText::new(title).size(14.5).strong().color(p.fg));
                 if !cand.model.trim().is_empty() {
                     widgets::badge(ui, p, &cand.model, None);
@@ -1458,11 +1483,14 @@ fn render_assessment_summary(
 
     if !assess.summary.trim().is_empty() {
         ui.add_space(6.0);
-        ui.label(
-            RichText::new(&assess.summary)
-                .size(13.0)
-                .line_height(Some(19.0))
-                .color(p.fg),
+        ui.add(
+            egui::Label::new(
+                RichText::new(&assess.summary)
+                    .size(13.0)
+                    .line_height(Some(19.0))
+                    .color(p.fg),
+            )
+            .wrap(),
         );
     }
 
@@ -1480,6 +1508,7 @@ fn render_assessment_summary(
                 for (name, val) in chunk {
                     ui.vertical(|ui| {
                         ui.set_width(col_w);
+                        ui.set_max_width(col_w);
                         render_criterion_bar(ui, p, name, *val);
                     });
                 }
@@ -1497,18 +1526,37 @@ fn render_assessment_summary(
                 .color(p.muted),
         );
         ui.add_space(4.0);
+        let gap_w = (ui.available_width() - 16.0).max(120.0);
         for gap in &assess.gaps {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(RichText::new("•").size(13.0).color(p.accent));
-                ui.label(
-                    RichText::new(gap)
-                        .size(12.5)
-                        .line_height(Some(18.0))
-                        .color(p.fg),
-                );
+                ui.allocate_ui_with_layout(vec2(gap_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_max_width(gap_w);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(gap)
+                                .size(12.5)
+                                .line_height(Some(18.0))
+                                .color(p.fg),
+                        )
+                        .wrap(),
+                    );
+                });
             });
+            ui.add_space(2.0);
         }
+    }
+}
+
+fn friendly_candidate_title(raw: &str) -> &str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => "Suggestion ready",
+        "improve" => "Suggested improvement",
+        "rebuild" => "Rewritten draft",
+        "engineer" => "Engineered prompt",
+        "refine" => "Refined prompt",
+        _ => raw.trim(),
     }
 }
 
