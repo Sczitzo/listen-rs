@@ -1180,7 +1180,9 @@ impl ListenApp {
                     self.toast("Install canceled");
                 }
                 UiAction::StartBenchmark => {
-                    if self.core.phase() != Phase::Idle
+                    if self.core.engine_loading() || matches!(self.snap.engine, EngineState::Loading) {
+                        self.toast("Wait for the speech model to finish loading before running a benchmark.");
+                    } else if self.core.phase() != Phase::Idle
                         || self.workspace.busy()
                         || self.core.meeting_active()
                         || self.installer.is_active()

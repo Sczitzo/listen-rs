@@ -333,6 +333,7 @@ impl Core {
             core: self.clone(),
             prev_engine,
             prev_status,
+            completed: false,
         })
     }
 
@@ -418,6 +419,9 @@ impl Core {
     }
 
     pub fn resummarize_meeting(&self, id: u64) -> Result<(), String> {
+        if self.engine_loading() || matches!(self.shared.lock().unwrap().engine, EngineState::Loading) {
+            return Err("The speech model is still loading — try again in a moment.".into());
+        }
         if self.benchmark_active.load(Ordering::Acquire) {
             return Err("Finish the speech benchmark before re-summarizing a meeting.".into());
         }
@@ -980,15 +984,32 @@ pub(crate) struct EngineLoadClaim {
     core: Arc<Core>,
     prev_engine: EngineState,
     prev_status: String,
+    completed: bool,
 }
 
 impl Drop for EngineLoadClaim {
     fn drop(&mut self) {
-        self.core.engine_loading.store(false, Ordering::Release);
+        if !self.completed {
+            let mut sh = self
+                .core
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if matches!(sh.engine, EngineState::Loading) {
+                let msg = "Speech model failed to load — reload to retry.".to_owned();
+                sh.status = msg.clone();
+                sh.engine = EngineState::Unavailable(msg);
+            }
+            drop(sh);
+            self.core.engine_loading.store(false, Ordering::Release);
+            self.core.repaint();
+        } else {
+            self.core.engine_loading.store(false, Ordering::Release);
+        }
     }
 }
 
-fn run_claimed_engine_load<B, L>(claim: EngineLoadClaim, before_recheck: B, loader: L) -> bool
+fn run_claimed_engine_load<B, L>(mut claim: EngineLoadClaim, before_recheck: B, loader: L) -> bool
 where
     B: FnOnce(),
     L: FnOnce(&Settings) -> Result<Speech, String>,
@@ -1001,9 +1022,16 @@ where
         && !core.benchmark_active.load(Ordering::Acquire);
     if !still_idle {
         let mut sh = core.shared.lock().unwrap();
-        sh.engine = claim.prev_engine.clone();
-        sh.status = claim.prev_status.clone();
+        if matches!(claim.prev_engine, EngineState::Loading) {
+            let msg = "Speech model load was interrupted — reload to retry.".to_owned();
+            sh.engine = EngineState::Unavailable(msg.clone());
+            sh.status = msg;
+        } else {
+            sh.engine = claim.prev_engine.clone();
+            sh.status = claim.prev_status.clone();
+        }
         drop(sh);
+        claim.completed = true;
         drop(claim);
         core.repaint();
         return false;
@@ -1023,6 +1051,7 @@ where
         };
         sh.engine = state;
         drop(sh);
+        claim.completed = true;
         drop(claim);
         core.repaint();
         return true;
@@ -1044,6 +1073,7 @@ where
             sh.engine = EngineState::Unavailable(e);
         }
     }
+    claim.completed = true;
     drop(claim);
     core.repaint();
     true
@@ -1905,6 +1935,15 @@ where
 fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
     if let Some(claim) = core.begin_engine_reload() {
         std::thread::spawn(move || run_claimed_engine_load(claim, || {}, speech::load));
+    } else if !core.engine_loading() {
+        let mut sh = core.shared.lock().unwrap();
+        if matches!(sh.engine, EngineState::Loading) {
+            let msg = "Speech model load deferred — reload when ready.".to_owned();
+            sh.engine = EngineState::Unavailable(msg.clone());
+            sh.status = msg;
+        }
+        drop(sh);
+        core.repaint();
     }
     if !core.preview {
         crate::winput::prewarm_clipboard();
@@ -2417,6 +2456,10 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                     });
             }
             Cmd::ResummarizeMeeting { id, reply } => {
+                if core.engine_loading() || matches!(core.shared.lock().unwrap().engine, EngineState::Loading) {
+                    let _ = reply.send(Err("The speech model is still loading — try again in a moment.".into()));
+                    continue;
+                }
                 if core.benchmark_active.load(Ordering::Acquire) {
                     let _ = reply.send(Err("Finish the speech benchmark before re-summarizing a meeting.".into()));
                     continue;
@@ -4828,6 +4871,44 @@ mod tests {
             &core.shared.lock().unwrap().engine,
             EngineState::Ready(label) if label == "Parakeet"
         ));
+
+        // Startup abort (prev_engine == Loading) must NEVER leave EngineState::Loading orphaned.
+        core.benchmark_active.store(false, Ordering::Release);
+        {
+            let mut sh = core.shared.lock().unwrap();
+            sh.engine = EngineState::Loading;
+            sh.status = "Starting up…".into();
+        }
+        let startup_claim = core.begin_engine_reload().expect("startup claim");
+        core.benchmark_active.store(true, Ordering::Release);
+        assert!(!run_claimed_engine_load(
+            startup_claim,
+            || {},
+            |_| panic!("aborted startup load must not invoke loader"),
+        ));
+        assert!(!core.engine_loading());
+        assert!(matches!(
+            core.shared.lock().unwrap().engine,
+            EngineState::Unavailable(_)
+        ));
+
+        // Panic inside loader must clear engine_loading AND exit EngineState::Loading.
+        core.benchmark_active.store(false, Ordering::Release);
+        let panic_core = core.clone();
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let claim = panic_core.begin_engine_reload().expect("panic claim");
+            let mut claim_non_preview = claim;
+            // Dropping claim without `completed = true` simulates a loader panic.
+            claim_non_preview.completed = false;
+            panic!("simulated loader crash");
+        }));
+        assert!(panic_res.is_err());
+        assert!(!core.engine_loading());
+        assert!(matches!(
+            core.shared.lock().unwrap().engine,
+            EngineState::Unavailable(_)
+        ));
+        assert!(core.can_reload_engine());
     }
 
     #[test]

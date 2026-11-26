@@ -44,7 +44,7 @@ static NEWLINE_CMD: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCRATCH_CMD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*[.!?]+\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*[,.;!?]?[ \t]*)",
+        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*[.!?]+\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*(?:[.!?]+|[,;])?[ \t]*)",
     )
     .unwrap()
 });
@@ -823,17 +823,22 @@ fn can_reconcile_vocab(raw_span: &str, vocab_term: &str) -> Option<(bool, usize)
     if rn.is_empty() || vn.is_empty() {
         return None;
     }
+    if technical_literals(raw_span).next().is_some()
+        && technical_literals(vocab_term).next().is_none()
+    {
+        return None;
+    }
     if rn == vn {
-        if (raw_span.starts_with('-') && !vocab_term.starts_with('-'))
-            || (raw_span.ends_with('-') && !vocab_term.ends_with('-'))
-            || ARROW.is_match(raw_span)
-            || raw_span.split_whitespace().any(|tok| tok == "-")
+        let vocab_has_leading_dash = vocab_term.split_whitespace().any(|t| t.starts_with('-'));
+        let vocab_has_trailing_dash = vocab_term.split_whitespace().any(|t| t.ends_with('-'));
+        if raw_span.split_whitespace().any(|t| {
+            (t.starts_with('-') && !vocab_has_leading_dash)
+                || (t.ends_with('-') && !vocab_has_trailing_dash)
+        }) || ARROW.is_match(raw_span)
             || (raw_span.contains("--") && !vocab_term.contains("--"))
             || OPERATOR.find_iter(raw_span).any(|m| {
                 m.as_str().chars().any(|c| !matches!(c, '.' | '-' | '_'))
             })
-            || (technical_literals(raw_span).next().is_some()
-                && technical_literals(vocab_term).next().is_none())
         {
             return None;
         }
@@ -1282,14 +1287,19 @@ fn operator_segments_match_tighten(source: &str, content: &str) -> bool {
         if !s.is_empty() && c.is_empty() {
             return false;
         }
-        if i < src_ops.len() && !s.is_empty() && !is_sentence_exclamation(source, src_ops[i]) {
+        if i < src_ops.len()
+            && !s.is_empty()
+            && !(is_sentence_exclamation(source, src_ops[i])
+                && is_sentence_exclamation(content, cnt_ops[i]))
+        {
             if c.last() != s.last() {
                 return false;
             }
         }
         if i > 0 && !s.is_empty() {
-            let prev_op = src_ops[i - 1];
-            if is_sentence_exclamation(source, prev_op) {
+            if is_sentence_exclamation(source, src_ops[i - 1])
+                && is_sentence_exclamation(content, cnt_ops[i - 1])
+            {
                 let s_trimmed_empty = s.iter().all(|w| is_tighten_filler(w));
                 if !s_trimmed_empty && c.is_empty() {
                     return false;
@@ -3236,7 +3246,7 @@ fn capitalize_leading_word(s: &str) -> String {
 
 fn prev_word_in_clause(before: &str) -> Option<String> {
     let trimmed = before.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == ',');
-    if trimmed.ends_with(['.', '!', '?', '\n', '\r']) {
+    if trimmed.ends_with(['.', '!', '?', ';', '—', '\n', '\r']) {
         return None;
     }
     trimmed
@@ -3450,8 +3460,8 @@ fn try_apply_one_scratch_command(text: &str) -> Option<String> {
             continue;
         }
 
-        // Reject when preceded by modal/aux/infinitive/negation/subject words.
-        if let Some(prev) = prev_word_in_clause(&text[..sep.start()]) {
+        // Reject when preceded by modal/aux/infinitive/negation/subject words in the same clause.
+        if let Some(prev) = prev_word_in_clause(&text[..cmd.start()]) {
             if matches!(
                 prev.as_str(),
                 "to" | "don't"
@@ -4255,5 +4265,45 @@ mod tests {
         assert!(!second.discarded);
         assert!(second.locally_edited);
         assert_eq!(second.corrected, "Hi Alice.");
+
+        // Sentences ending in guarded prose words before sentence punctuation must still scratch.
+        for discarded_case in [
+            "Where are you? Scratch that.",
+            "I can't. Scratch that.",
+            "Yes, please! Scratch that.",
+            "No, I don't. Scratch that.",
+            "No way!! Scratch that!!",
+            "Send at 4 PM. Scratch that...",
+        ] {
+            let p = prepare_dictation(discarded_case, "");
+            assert!(p.discarded, "expected discard for: {discarded_case}");
+            assert_eq!(p.corrected, "", "expected empty for: {discarded_case}");
+        }
+
+        let after_guarded_prev = prepare_dictation("Hi Alice. What do you want? Scratch that.", "");
+        assert!(!after_guarded_prev.discarded);
+        assert_eq!(after_guarded_prev.corrected, "Hi Alice.");
+
+        // Multi-token flags, negative numbers, and fuzzy technical literals must not reconcile.
+        assert!(!is_safe("run git -c", "run GitC", "GitC"));
+        assert!(!is_safe("set offset -5", "set Offset5", "Offset5"));
+        assert!(!is_safe("open config.js", "open ConfigJSON", "ConfigJSON"));
+        assert!(!is_safe("edit user_name", "edit Usernames", "Usernames"));
+
+        // Sentence exclamation check must hold on BOTH source and content (no factorial/unary repurpose).
+        assert!(!is_safe_for_style(
+            "Compute n! for k",
+            "Compute ! for k",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(!is_safe_for_style(
+            "We want it! Check flag",
+            "We want !Check flag",
+            "",
+            Style::Tighten,
+            &[]
+        ));
     }
 }
