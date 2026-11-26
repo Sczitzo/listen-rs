@@ -1073,8 +1073,6 @@ fn render_save_favorite_prompt(
                 actions.push(UiAction::LabSaveFavorite(
                     state.save_fav_name.trim().to_owned(),
                 ));
-                state.save_fav_name.clear();
-                state.save_fav_open = false;
             }
             if widgets::ghost_btn(ui, p, "Cancel", true).clicked() {
                 state.save_fav_open = false;

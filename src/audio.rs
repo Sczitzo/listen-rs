@@ -437,6 +437,7 @@ impl StreamResampler {
 }
 
 struct MeetingMixBuffer {
+    gen: u64,
     mic_pending: Vec<f32>,
     loop_pending: Vec<f32>,
     mixed: Vec<f32>,
@@ -449,6 +450,7 @@ struct MeetingMixBuffer {
 impl MeetingMixBuffer {
     fn new(max_buffered_samples: usize) -> Self {
         Self {
+            gen: 0,
             mic_pending: Vec::with_capacity(MEETING_SYNC_LAG_16K * 2),
             loop_pending: Vec::with_capacity(MEETING_SYNC_LAG_16K * 2),
             mixed: Vec::with_capacity(crate::speech::SAMPLE_RATE * 30),
@@ -459,7 +461,8 @@ impl MeetingMixBuffer {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset_for_gen(&mut self, gen: u64) {
+        self.gen = gen;
         self.mic_pending.clear();
         self.loop_pending.clear();
         self.mixed.clear();
@@ -681,7 +684,7 @@ impl MeetingLevels {
 }
 
 enum MeetingCmd {
-    Start(String, bool, mpsc::Sender<Result<MeetingStartInfo, String>>),
+    Start(String, bool, u64, mpsc::Sender<Result<MeetingStartInfo, String>>),
     Stop(mpsc::Sender<Vec<f32>>),
     Cancel,
 }
@@ -710,26 +713,74 @@ impl MeetingRecorder {
         Self { tx, mix }
     }
 
-    /// Start capturing the selected microphone and optionally default system output loopback.
+    /// Start capturing the selected microphone and optionally default system output loopback
+    /// tagged with `gen` so stale drain workers from earlier meetings cannot read or steal samples.
     /// If loopback is enabled but cannot be opened, falls back cleanly to mic-only with `loopback_active: false`.
-    pub fn start_meeting(&self, device: &str, include_system_audio: bool) -> Result<MeetingStartInfo, String> {
+    pub fn start_meeting_for_gen(
+        &self,
+        device: &str,
+        include_system_audio: bool,
+        gen: u64,
+    ) -> Result<MeetingStartInfo, String> {
         let (t, r) = mpsc::channel();
-        let _ = self.tx.send(MeetingCmd::Start(device.to_string(), include_system_audio, t));
+        let _ = self.tx.send(MeetingCmd::Start(
+            device.to_string(),
+            include_system_audio,
+            gen,
+            t,
+        ));
         r.recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|_| Err("the meeting recorder didn't respond".into()))
     }
 
+    /// Start capturing the selected microphone and optionally default system output loopback.
+    #[allow(dead_code)]
+    pub fn start_meeting(&self, device: &str, include_system_audio: bool) -> Result<MeetingStartInfo, String> {
+        self.start_meeting_for_gen(device, include_system_audio, 0)
+    }
+
+    /// Drain all ready mixed 16 kHz mono samples accumulated since the last call without stopping,
+    /// atomically gated on `gen` so a detached drain thread from an earlier meeting gets nothing.
+    pub fn take_chunk_16k_for_gen(&self, gen: u64) -> Vec<f32> {
+        let mut mix = self.mix.lock().unwrap();
+        if mix.gen != gen {
+            return Vec::new();
+        }
+        mix.take_chunk()
+    }
+
+    /// Number of mixed 16 kHz samples currently ready to drain for `gen`, or `0` if `gen` is stale.
+    pub fn buffered_len_16k_for_gen(&self, gen: u64) -> usize {
+        let mix = self.mix.lock().unwrap();
+        if mix.gen != gen {
+            return 0;
+        }
+        mix.buffered_len()
+    }
+
+    /// Total elapsed meeting audio duration in whole seconds for `gen`, or `None` if `gen` is stale.
+    pub fn total_duration_secs_for_gen(&self, gen: u64) -> Option<u64> {
+        let mix = self.mix.lock().unwrap();
+        if mix.gen != gen {
+            return None;
+        }
+        Some(mix.total_duration_secs())
+    }
+
     /// Drain all ready mixed 16 kHz mono samples accumulated since the last call without stopping.
+    #[allow(dead_code)]
     pub fn take_chunk_16k(&self) -> Vec<f32> {
         self.mix.lock().unwrap().take_chunk()
     }
 
     /// Number of mixed 16 kHz samples currently ready to drain via `take_chunk_16k`.
+    #[allow(dead_code)]
     pub fn buffered_len_16k(&self) -> usize {
         self.mix.lock().unwrap().buffered_len()
     }
 
     /// Total elapsed meeting audio duration in whole seconds (including already-drained chunks).
+    #[allow(dead_code)]
     pub fn total_duration_secs(&self) -> u64 {
         self.mix.lock().unwrap().total_duration_secs()
     }
@@ -757,10 +808,10 @@ fn meeting_audio_thread(
 
     for cmd in rx {
         match cmd {
-            MeetingCmd::Start(device_name, include_system_audio, reply) => {
+            MeetingCmd::Start(device_name, include_system_audio, gen, reply) => {
                 current = None;
                 levels.reset();
-                mix.lock().unwrap().reset();
+                mix.lock().unwrap().reset_for_gen(gen);
 
                 match open_meeting_streams(
                     &device_name,
@@ -773,6 +824,7 @@ fn meeting_audio_thread(
                         let _ = reply.send(Ok(info));
                     }
                     Err(e) => {
+                        mix.lock().unwrap().reset_for_gen(0);
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -781,13 +833,18 @@ fn meeting_audio_thread(
                 // Drop both streams before draining the mix buffer so no callback runs after flush.
                 drop(current.take());
                 levels.reset();
-                let tail = mix.lock().unwrap().finish();
+                let tail = {
+                    let mut guard = mix.lock().unwrap();
+                    let tail = guard.finish();
+                    guard.gen = 0;
+                    tail
+                };
                 let _ = reply.send(tail);
             }
             MeetingCmd::Cancel => {
                 drop(current.take());
                 levels.reset();
-                mix.lock().unwrap().reset();
+                mix.lock().unwrap().reset_for_gen(0);
             }
         }
     }
@@ -1365,5 +1422,40 @@ mod tests {
         levels.update_loopback_at(0.4, t0 + Duration::from_millis(1600));
         assert!((levels.loop_level() - 0.4).abs() < 1e-5);
         assert!((levels.combined_level() - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn meeting_recorder_generation_gates_drain_and_duration_queries() {
+        let (tx, _rx) = mpsc::channel();
+        let mix = Arc::new(Mutex::new(MeetingMixBuffer::new(MEETING_MAX_SAMPLES_16K)));
+        let rec = MeetingRecorder {
+            tx,
+            mix: mix.clone(),
+        };
+
+        {
+            let mut m = mix.lock().unwrap();
+            m.reset_for_gen(2);
+            m.push_mic(&vec![0.15f32; 16_000]);
+        }
+
+        // Stale generation (Meeting #1) must never read length, duration, or steal samples from Meeting #2.
+        assert_eq!(rec.buffered_len_16k_for_gen(1), 0);
+        assert_eq!(rec.total_duration_secs_for_gen(1), None);
+        assert!(rec.take_chunk_16k_for_gen(1).is_empty());
+
+        // Active generation (Meeting #2) still sees all buffered samples untouched.
+        let expected_len = 16_000 - MEETING_SYNC_LAG_16K;
+        assert_eq!(rec.buffered_len_16k_for_gen(2), expected_len);
+        assert_eq!(rec.total_duration_secs_for_gen(2), Some(1));
+        let drained = rec.take_chunk_16k_for_gen(2);
+        assert_eq!(drained.len(), expected_len);
+        assert!(drained.iter().all(|&s| (s - 0.15).abs() < 1e-5));
+
+        // Once stopped/reset to gen 0, gen 2 becomes stale too.
+        mix.lock().unwrap().reset_for_gen(0);
+        assert_eq!(rec.buffered_len_16k_for_gen(2), 0);
+        assert_eq!(rec.total_duration_secs_for_gen(2), None);
+        assert!(rec.take_chunk_16k_for_gen(2).is_empty());
     }
 }

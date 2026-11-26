@@ -935,6 +935,9 @@ where
     let _clip = match acquire() {
         Ok(guard) => guard,
         Err(reason) => {
+            if snapshot.saved.is_empty() {
+                return Err(format!("Could not restore previous clipboard ({reason})."));
+            }
             let seq = post_copy_seq.unwrap_or_else(&current_seq);
             record_pending_with_owner(Some(snapshot.saved), seq, false);
             return Err(format!(
@@ -950,6 +953,10 @@ where
     match write_snapshot(&snapshot.saved) {
         Ok(()) => Ok(()),
         Err(reason) => {
+            drop(_clip);
+            if snapshot.saved.is_empty() {
+                return Err(format!("Could not restore previous clipboard ({reason})."));
+            }
             let seq = current_seq();
             record_pending_with_owner(Some(snapshot.saved), seq, false);
             Err(format!(
@@ -1156,8 +1163,11 @@ mod tests {
         assert!(!is_safe_standard_format(14)); // CF_ENHMETAFILE
     }
 
+    static TEST_PENDING_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn restore_after_command_preserves_snapshot_in_pending_on_acquire_or_write_failure() {
+        let _serial = TEST_PENDING_SERIAL.lock().unwrap();
         struct PendingReset;
         impl Drop for PendingReset {
             fn drop(&mut self) {
@@ -1225,6 +1235,86 @@ mod tests {
             || 42,
         );
         assert!(ok.is_ok());
+        assert!(PENDING.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_after_command_records_post_close_seq_and_skips_empty_snapshot_pending() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let _serial = TEST_PENDING_SERIAL.lock().unwrap();
+        struct PendingReset;
+        impl Drop for PendingReset {
+            fn drop(&mut self) {
+                *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let _reset = PendingReset;
+        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        // Guard simulating CloseClipboard synthesizing CF_TEXT/CF_OEMTEXT and bumping seq on drop.
+        struct CloseBumpGuard(Arc<AtomicU32>);
+        impl Drop for CloseBumpGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let seq = Arc::new(AtomicU32::new(50));
+        let saved: Snapshot = vec![(CF_UNICODETEXT, vec![b'A', 0, 0, 0])];
+        let seq_for_guard = Arc::clone(&seq);
+        let seq_for_read = Arc::clone(&seq);
+
+        let err = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved: saved.clone() }),
+            Some(50),
+            move || Ok(CloseBumpGuard(seq_for_guard)),
+            |_| Err("Cannot restore clipboard format."),
+            move || seq_for_read.load(AtomicOrdering::SeqCst),
+        )
+        .unwrap_err();
+        assert!(err.contains("Resolve clipboard recovery in Listen."));
+        let (recorded_saved, recorded_seq) = {
+            let guard = PENDING.lock().unwrap();
+            let pending = guard.as_ref().expect("non-empty snapshot must be recorded in PENDING");
+            (pending.saved.clone(), pending.delivery_seq)
+        };
+        assert_eq!(recorded_saved, saved);
+        assert_eq!(
+            recorded_seq, 51,
+            "delivery_seq must be sampled AFTER CloseClipboard drop bumps sequence"
+        );
+        *PENDING.lock().unwrap() = None;
+
+        // Empty snapshot on acquire failure must NOT populate PENDING or mention recovery.
+        let empty_acq_err = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved: Vec::new() }),
+            Some(60),
+            || Err::<(), &'static str>("Clipboard is busy"),
+            |_| panic!("write_snapshot must not run"),
+            || 60,
+        )
+        .unwrap_err();
+        assert_eq!(
+            empty_acq_err,
+            "Could not restore previous clipboard (Clipboard is busy)."
+        );
+        assert!(PENDING.lock().unwrap().is_none());
+
+        // Empty snapshot on write failure must NOT populate PENDING or mention recovery.
+        let empty_write_err = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved: Vec::new() }),
+            Some(60),
+            || Ok(()),
+            |_| Err("Cannot clear clipboard."),
+            || 60,
+        )
+        .unwrap_err();
+        assert_eq!(
+            empty_write_err,
+            "Could not restore previous clipboard (Cannot clear clipboard.)."
+        );
         assert!(PENDING.lock().unwrap().is_none());
     }
 }

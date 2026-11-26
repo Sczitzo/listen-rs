@@ -35,6 +35,8 @@ static PREAMBLE: LazyLock<Regex> = LazyLock::new(|| {
 static BACKTICKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`+").unwrap());
 static URL_SPAN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>"'`)\]]+"#).unwrap());
+static EMAIL_SPAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
 static FENCED_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```.*?```").unwrap());
 static NEWLINE_CMD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?P<pre>[ \t,]*)\b(?P<cmd>new\s+(?:paragraph|line))\b(?P<post>[ \t,.]*)")
@@ -42,7 +44,7 @@ static NEWLINE_CMD: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCRATCH_CMD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*\.\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*[,.;!?]?[ \t]*)",
+        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*[.!?]\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*[,.;!?]?[ \t]*)",
     )
     .unwrap()
 });
@@ -488,6 +490,14 @@ fn apply_vocab_postpass(text: &str, vocabulary: &str) -> (String, bool) {
         .find_iter(text)
         .map(|m| (m.start(), m.end()))
         .collect();
+    let email_ranges: Vec<(usize, usize)> = EMAIL_SPAN
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    let tech_ranges: Vec<(usize, usize)> = technical_literal_matches(text)
+        .into_iter()
+        .map(|(s, e, _)| (s, e))
+        .collect();
 
     let overlaps = |ranges: &[(usize, usize)], s: usize, e: usize| {
         ranges.iter().any(|&(rs, re)| s < re && e > rs)
@@ -500,11 +510,19 @@ fn apply_vocab_postpass(text: &str, vocabulary: &str) -> (String, bool) {
         if let Ok(re) = Regex::new(&exact_pat) {
             for m in re.find_iter(text) {
                 let (s, e) = (m.start(), m.end());
-                if !has_whole_word_boundaries(text, s, e) || overlaps(&backtick_ranges, s, e) {
+                if !has_whole_word_boundaries(text, s, e)
+                    || overlaps(&backtick_ranges, s, e)
+                    || overlaps(&email_ranges, s, e)
+                {
                     continue;
                 }
                 if overlaps(&url_ranges, s, e)
                     && !url_ranges.iter().any(|&(us, ue)| us == s && ue == e)
+                {
+                    continue;
+                }
+                if overlaps(&tech_ranges, s, e)
+                    && !tech_ranges.iter().any(|&(ts, te)| ts == s && te == e)
                 {
                     continue;
                 }
@@ -520,6 +538,12 @@ fn apply_vocab_postpass(text: &str, vocabulary: &str) -> (String, bool) {
                     if !has_whole_word_boundaries(text, s, e)
                         || overlaps(&backtick_ranges, s, e)
                         || overlaps(&url_ranges, s, e)
+                        || overlaps(&email_ranges, s, e)
+                    {
+                        continue;
+                    }
+                    if overlaps(&tech_ranges, s, e)
+                        && !tech_ranges.iter().any(|&(ts, te)| ts == s && te == e)
                     {
                         continue;
                     }
@@ -1337,7 +1361,13 @@ fn is_safe_tighten(
             || !src_segs
                 .iter()
                 .zip(cnt_segs.iter())
-                .all(|(s, c)| is_ordered_subsequence(c, s))
+                .enumerate()
+                .all(|(i, (s, c))| {
+                    is_ordered_subsequence(c, s)
+                        && (s.is_empty() || !c.is_empty())
+                        && (i + 1 >= src_segs.len() || s.is_empty() || c.last() == s.last())
+                        && (i == 0 || s.is_empty() || c.first() == s.first())
+                })
         {
             return false;
         }
@@ -1835,7 +1865,7 @@ pub fn keeps_list_lines(local: &str, candidate: &str, vocabulary: &str) -> bool 
     )
 }
 
-fn keeps_list_lines_for_style(
+pub(crate) fn keeps_list_lines_for_style(
     local: &str,
     candidate: &str,
     vocabulary: &str,
@@ -3235,15 +3265,17 @@ fn apply_newline_commands(text: &str) -> (String, bool) {
         }
 
         let after_rest = &text[post.end()..];
-        // Only strip trailing '.' after the command if more text follows it.
-        let consume_end = if after_rest.trim().is_empty() && post.as_str().contains('.') {
-            cmd.end()
-        } else {
-            post.end()
-        };
+        let trailing_period = after_rest.trim().is_empty() && post.as_str().contains('.');
+        let consume_end = post.end();
 
         let left_slice = &text[pos..pre.start()];
         out.push_str(left_slice);
+        if trailing_period {
+            let left_trimmed = left_slice.trim_end();
+            if !left_trimmed.is_empty() && !left_trimmed.ends_with(['.', '!', '?']) {
+                out.push('.');
+            }
+        }
         if is_paragraph {
             out.push_str("\n\n");
         } else {
@@ -3383,7 +3415,7 @@ fn try_apply_one_scratch_command(text: &str) -> Option<String> {
         }
 
         let sep_str = sep.as_str();
-        let has_period_sep = sep_str.contains('.');
+        let has_period_sep = sep_str.contains(['.', '!', '?']);
         let has_comma_sep = sep_str.contains([',', ';', '—']) || sep_str.contains('-');
         let remainder = &text[after.end()..];
         let at_end = remainder.trim().is_empty();
@@ -3391,8 +3423,12 @@ fn try_apply_one_scratch_command(text: &str) -> Option<String> {
             .as_str()
             .contains([',', '.', ';', '!', '?']);
 
-        // Extra guard for `delete that`: reject demonstrative objects like "delete that file".
+        // Extra guard for `delete that`: reject demonstrative objects like "delete that file",
+        // questions like "Did Bob delete that?", and mid-clause prose like "clicks delete that, it breaks."
         if is_delete {
+            if after.as_str().contains('?') && !has_comma_sep && !has_period_sep {
+                continue;
+            }
             if !at_end && !after_has_punct {
                 let next = next_immediate_word(&text[cmd.end()..]).unwrap_or_default();
                 let is_clause_restarter = matches!(
@@ -3427,7 +3463,7 @@ fn try_apply_one_scratch_command(text: &str) -> Option<String> {
                 if !is_clause_restarter {
                     continue;
                 }
-            } else if !at_end && !has_comma_sep && !has_period_sep && !after_has_punct {
+            } else if !at_end && !has_comma_sep && !has_period_sep {
                 continue;
             }
         }
@@ -3938,5 +3974,132 @@ mod tests {
         assert!(!is_safe("run --dry-run", "run --dry_run", ""));
         // Already-backticked spans in raw still require exact case preservation.
         assert!(!is_safe("Edit `readme.md`", "Edit `README.md`", ""));
+    }
+
+    #[test]
+    fn vocab_postpass_preserves_flags_paths_filenames_and_emails() {
+        let vocab = "Ollama, Config, CLAUDE.md, listen-rs";
+
+        // CLI flags, file paths, dotted filenames, and emails must NOT be partially rewritten.
+        for untouched in [
+            "Pass --ollama-host to the CLI",
+            r"Open C:\work\ollama\app.py now",
+            "Edit config.json before restarting",
+            "Email alice@ollama.com about it",
+        ] {
+            let prep = prepare_dictation(untouched, vocab);
+            assert_eq!(prep.corrected, untouched, "must preserve: {untouched}");
+            assert!(!prep.locally_edited, "must not mark edited: {untouched}");
+        }
+
+        // Standalone vocab words and full-literal vocab entries still rewrite cleanly.
+        let standalone = prepare_dictation("check ollama and --ollama-host", vocab);
+        assert_eq!(standalone.corrected, "check Ollama and --ollama-host");
+        assert!(standalone.locally_edited);
+
+        let full_lit = prepare_dictation("update claude.md and listen-rs", vocab);
+        assert_eq!(full_lit.corrected, "update CLAUDE.md and listen-rs");
+        assert!(full_lit.locally_edited);
+
+        let full_lit_hyphen = prepare_dictation("build Listen-RS now", vocab);
+        assert_eq!(full_lit_hyphen.corrected, "build listen-rs now");
+        assert!(full_lit_hyphen.locally_edited);
+    }
+
+    #[test]
+    fn scratch_command_handles_question_and_exclamation_boundaries() {
+        let q = prepare_dictation("Are you coming? Scratch that.", "");
+        assert!(q.discarded, "expected discarded for question scratch");
+        assert_eq!(q.corrected, "");
+
+        let ex = prepare_dictation("Wait for me! Scratch that.", "");
+        assert!(ex.discarded, "expected discarded for exclamation scratch");
+        assert_eq!(ex.corrected, "");
+
+        let keep_prev = prepare_dictation("Hi Alice. Are you coming? Scratch that.", "");
+        assert!(!keep_prev.discarded);
+        assert!(keep_prev.locally_edited);
+        assert_eq!(keep_prev.corrected, "Hi Alice.");
+
+        let replace_q = prepare_dictation("What time is it? Scratch that, what day is it?", "");
+        assert!(!replace_q.discarded);
+        assert!(replace_q.locally_edited);
+        assert_eq!(replace_q.corrected, "What day is it?");
+    }
+
+    #[test]
+    fn style_tighten_preserves_operator_operands() {
+        // Dropping operands bordering operators must be rejected under Style::Tighten.
+        assert!(!is_safe_for_style(
+            "Check the value of x + y",
+            "Check the value of x +",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(!is_safe_for_style(
+            "Compute a = b + c and print result",
+            "Compute a = + c and print result",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(!is_safe_for_style(
+            "Check if x <= y before shipping",
+            "Check if x <= before shipping",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+
+        // Valid filler tightening around operators remains accepted.
+        assert!(is_safe_for_style(
+            "um basically check the value of x + y",
+            "Check the value of x + y",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn newline_commands_at_end_do_not_emit_orphan_period() {
+        let para = prepare_dictation("The build passed new paragraph.", "");
+        assert!(para.locally_edited);
+        assert!(!para.discarded);
+        assert_eq!(para.corrected, "The build passed.\n\n");
+        assert!(!para.corrected.ends_with('.'));
+
+        let line = prepare_dictation("Hello new line.", "");
+        assert!(line.locally_edited);
+        assert!(!line.discarded);
+        assert_eq!(line.corrected, "Hello.\n");
+        assert!(!line.corrected.ends_with('.'));
+
+        // Already punctuated sentence before trailing newline command must not double-dot.
+        let already = prepare_dictation("The build passed. New paragraph.", "");
+        assert_eq!(already.corrected, "The build passed.\n\n");
+    }
+
+    #[test]
+    fn delete_that_prose_and_question_guards() {
+        for prose in [
+            "If someone clicks delete that, it breaks.",
+            "Did Bob delete that?",
+        ] {
+            let p = prepare_dictation(prose, "");
+            assert_eq!(p.corrected, prose, "prose must remain untouched: {prose}");
+            assert!(!p.locally_edited);
+            assert!(!p.discarded);
+        }
+
+        let exec_end = prepare_dictation("Send it to Bob. Delete that.", "");
+        assert!(exec_end.discarded);
+        assert_eq!(exec_end.corrected, "");
+
+        let exec_mid = prepare_dictation("Send it to Bob, delete that, send it to Alice.", "");
+        assert!(!exec_mid.discarded);
+        assert!(exec_mid.locally_edited);
+        assert_eq!(exec_mid.corrected, "Send it to Alice.");
     }
 }

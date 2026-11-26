@@ -1039,6 +1039,7 @@ fn eval_benchmark_case(
     raw: &str,
     prepared: &formatting::PreparedDictation,
     out: &str,
+    style: Style,
 ) -> bool {
     let normalized = out.replace("\r\n", "\n");
     let trimmed = normalized.trim();
@@ -1076,12 +1077,12 @@ fn eval_benchmark_case(
     }
     if case.check_list {
         if let Some(local_list) = prepared.local_list.as_deref() {
-            if !formatting::keeps_list_lines(local_list, trimmed, "") {
+            if !formatting::keeps_list_lines_for_style(local_list, trimmed, "", style, &[]) {
                 return false;
             }
         }
     }
-    if case.check_safe && !prepared.is_safe_output(trimmed, "") {
+    if case.check_safe && !prepared.is_safe_output_for_style(trimmed, style, &[]) {
         return false;
     }
     true
@@ -1333,7 +1334,7 @@ impl BenchmarkManager {
                     Ok(out) => {
                         consecutive_errors = 0;
                         times.push(elapsed);
-                        if eval_benchmark_case(case, case.raw, &prepared, &out) {
+                        if eval_benchmark_case(case, case.raw, &prepared, &out, run_settings.style) {
                             passed += 1;
                         }
                     }
@@ -1666,13 +1667,15 @@ mod tests {
             &BENCHMARK_CASES[0],
             BENCHMARK_CASES[0].raw,
             &prep0,
-            "So I want to ship the settings fix today."
+            "So I want to ship the settings fix today.",
+            Style::Clean,
         ));
         assert!(!eval_benchmark_case(
             &BENCHMARK_CASES[0],
             BENCHMARK_CASES[0].raw,
             &prep0,
-            "Um, so I want to ship the, uh, settings fix today."
+            "Um, so I want to ship the, uh, settings fix today.",
+            Style::Clean,
         ));
 
         let prep6 = formatting::prepare_dictation(BENCHMARK_CASES[6].raw, "");
@@ -1681,13 +1684,15 @@ mod tests {
             &BENCHMARK_CASES[6],
             BENCHMARK_CASES[6].raw,
             &prep6,
-            "The build passed.\n\nNow let's test the UI."
+            "The build passed.\n\nNow let's test the UI.",
+            Style::Clean,
         ));
         assert!(!eval_benchmark_case(
             &BENCHMARK_CASES[6],
             BENCHMARK_CASES[6].raw,
             &prep6,
-            "The build passed. Now let's test the UI."
+            "The build passed. Now let's test the UI.",
+            Style::Clean,
         ));
 
         let prep7 = formatting::prepare_dictation(BENCHMARK_CASES[7].raw, "");
@@ -1696,19 +1701,22 @@ mod tests {
             &BENCHMARK_CASES[7],
             BENCHMARK_CASES[7].raw,
             &prep7,
-            "Set the port to 3000."
+            "Set the port to 3000.",
+            Style::Clean,
         ));
         assert!(!eval_benchmark_case(
             &BENCHMARK_CASES[7],
             BENCHMARK_CASES[7].raw,
             &prep7,
-            "Set the port to 9000."
+            "Set the port to 9000.",
+            Style::Clean,
         ));
         assert!(!eval_benchmark_case(
             &BENCHMARK_CASES[7],
             BENCHMARK_CASES[7].raw,
             &prep7,
-            "Sure! Here is your text: set the port to 3000."
+            "Sure! Here is your text: set the port to 3000.",
+            Style::Clean,
         ));
 
         let prep9 = formatting::prepare_dictation(BENCHMARK_CASES[9].raw, "");
@@ -1716,7 +1724,8 @@ mod tests {
             &BENCHMARK_CASES[9],
             BENCHMARK_CASES[9].raw,
             &prep9,
-            "We need to make paste instant instead of typing letter by letter."
+            "We need to make paste instant instead of typing letter by letter.",
+            Style::Clean,
         ));
         let list_raw = BENCHMARK_CASES[5].raw;
         let list_prepared = formatting::prepare_dictation(list_raw, "");
@@ -1728,7 +1737,8 @@ mod tests {
             &BENCHMARK_CASES[5],
             list_raw,
             &list_prepared,
-            list_prepared.model_input()
+            list_prepared.model_input(),
+            Style::Clean,
         ));
         assert_eq!(median(vec![0.9, 0.3, 0.5]), 0.5);
         assert_eq!(median(vec![0.8, 0.2, 0.4, 0.6]), 0.5);
@@ -1753,6 +1763,32 @@ mod tests {
         assert_eq!(loaded.results["qwen3.5:4b"].passed, 11);
         assert_eq!(loaded.results["qwen3.5:4b"].cases, 12);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn benchmark_evaluator_respects_cleanup_style() {
+        let prep0 = formatting::prepare_dictation(BENCHMARK_CASES[0].raw, "");
+        let tightened = "I want to ship the settings fix today.";
+        assert!(
+            eval_benchmark_case(
+                &BENCHMARK_CASES[0],
+                BENCHMARK_CASES[0].raw,
+                &prep0,
+                tightened,
+                Style::Tighten,
+            ),
+            "Style::Tighten should accept dropping filler 'so' in benchmark case 0"
+        );
+        assert!(
+            !eval_benchmark_case(
+                &BENCHMARK_CASES[0],
+                BENCHMARK_CASES[0].raw,
+                &prep0,
+                tightened,
+                Style::Clean,
+            ),
+            "Style::Clean should remain strict and reject dropping 'so'"
+        );
     }
 
     #[test]

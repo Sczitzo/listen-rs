@@ -717,6 +717,19 @@ fn command_mode_system_prompt(vocab: &str) -> String {
     system
 }
 
+fn finalize_command_mode_output(
+    raw: &str,
+    selected: &str,
+    voice_command: &str,
+) -> Result<String, String> {
+    let cleaned = crate::command_mode::clean_command_output_for(raw, selected, voice_command);
+    if cleaned.is_empty() {
+        Err("the model returned nothing".into())
+    } else {
+        Ok(cleaned)
+    }
+}
+
 /// Transform highlighted text using a spoken Command Mode instruction via local Ollama.
 pub fn run_command_mode(s: &Settings, selected: &str, voice_command: &str) -> Result<String, String> {
     let system = command_mode_system_prompt(&s.vocab);
@@ -730,12 +743,7 @@ pub fn run_command_mode(s: &Settings, selected: &str, voice_command: &str) -> Re
         true,
         false,
     )?;
-    let cleaned = crate::command_mode::clean_command_output(&raw, selected);
-    if cleaned.is_empty() {
-        Err("the model returned nothing".into())
-    } else {
-        Ok(cleaned)
-    }
+    finalize_command_mode_output(&raw, selected, voice_command)
 }
 
 const MEETING_SINGLE_SHOT_MAX_CHARS: usize = 12_000;
@@ -1590,6 +1598,31 @@ mod local_tests {
             "content": [{"type": "text", "text": "<think>nothing else</think>"}]
         });
         assert!(extract_claude_text(&think_only).is_err());
+    }
+
+    #[test]
+    fn finalize_command_mode_output_strips_outer_fences_and_rejects_empty_fences() {
+        let stripped = finalize_command_mode_output(
+            "```text\nHello world.\n```",
+            "hello world",
+            "capitalize this",
+        )
+        .unwrap();
+        assert_eq!(stripped, "Hello world.");
+
+        // Preserves fences when the user explicitly asks for a code block.
+        let kept = finalize_command_mode_output(
+            "```rust\nlet x = 1;\n```",
+            "let x = 1;",
+            "wrap in a markdown code block",
+        )
+        .unwrap();
+        assert_eq!(kept, "```rust\nlet x = 1;\n```");
+
+        // Empty outer fence unwraps to empty and returns the standard error.
+        let err = finalize_command_mode_output("```\n   \n```", "hello world", "fix grammar")
+            .unwrap_err();
+        assert_eq!(err, "the model returned nothing");
     }
 }
 

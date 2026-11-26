@@ -1450,28 +1450,22 @@ impl Workspace {
     }
 }
 
-fn normalized_favorite_key(fav: &Favorite) -> (String, String) {
-    let name = fav
-        .name
-        .split_whitespace()
+const FAVORITES_MIGRATED_MARKER: &str = "favorites-migrated.v1";
+
+fn normalized_favorite_name(name: &str) -> String {
+    name.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_lowercase();
-    let text = fav
-        .text
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .trim()
-        .to_owned();
-    (name, text)
+        .to_lowercase()
 }
 
 /// Non-destructively merges favorites from `legacy` that are missing from `existing`
-/// (matched by normalized name + text), never duplicating and returning `true` if any were added.
+/// (matched by normalized name so edited favorites are never duplicated by stale legacy copies),
+/// returning `true` if any were added.
 pub fn merge_missing_favorites(existing: &mut Vec<Favorite>, legacy: &[Favorite]) -> bool {
-    let mut seen: HashSet<(String, String)> = existing
+    let mut seen: HashSet<String> = existing
         .iter()
-        .map(normalized_favorite_key)
+        .map(|fav| normalized_favorite_name(&fav.name))
         .collect();
     let mut added = false;
     for fav in legacy {
@@ -1479,7 +1473,7 @@ pub fn merge_missing_favorites(existing: &mut Vec<Favorite>, legacy: &[Favorite]
         if name.is_empty() || fav.text.trim().is_empty() {
             continue;
         }
-        if seen.insert(normalized_favorite_key(fav)) {
+        if seen.insert(normalized_favorite_name(name)) {
             let mut item = fav.clone();
             item.name = name.to_owned();
             existing.push(item);
@@ -1489,16 +1483,36 @@ pub fn merge_missing_favorites(existing: &mut Vec<Favorite>, legacy: &[Favorite]
     added
 }
 
+/// Strictly one-time migration of legacy workspace favorites into `existing`.
+/// Writes `favorites-migrated.v1` in `profile` after a successful merge (or when nothing needed
+/// merging) so deleted favorites never resurrect on restart. Skips without writing the marker when
+/// `read_only` is true or when `save` fails.
+pub fn migrate_legacy_favorites_once(
+    profile: &Path,
+    existing: &mut Vec<Favorite>,
+    legacy: &[Favorite],
+    read_only: bool,
+    save: impl FnOnce(&[Favorite]) -> io::Result<()>,
+) -> io::Result<bool> {
+    let marker = profile.join(FAVORITES_MIGRATED_MARKER);
+    if marker.exists() || read_only {
+        return Ok(false);
+    }
+    let mut candidate = existing.clone();
+    let added = merge_missing_favorites(&mut candidate, legacy);
+    if added {
+        save(&candidate)?;
+        *existing = candidate;
+    }
+    storage::atomic_write(&marker, b"1\n")?;
+    Ok(added)
+}
+
 fn migrate_legacy(profile: &Path) -> io::Result<State> {
     let mut state = State::default();
     match fs::read_to_string(profile.join("draft.txt")) {
         Ok(text) if !text.is_empty() => state.active.add_revision(text, "typed"),
         Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    match fs::read(profile.join("favorites.json")) {
-        Ok(bytes) => state.favorites = serde_json::from_slice(&bytes).map_err(io::Error::other)?,
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -1523,7 +1537,7 @@ mod tests {
     }
 
     fn clean_profile(path: &Path) {
-        for name in ["workspace.json", "draft.txt"] {
+        for name in ["workspace.json", "draft.txt", FAVORITES_MIGRATED_MARKER] {
             match fs::remove_file(path.join(name)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -1998,6 +2012,80 @@ mod tests {
         assert!(corrupt.is_read_only());
         assert!(corrupt.legacy_favorites().is_empty());
         assert_eq!(fs::read_to_string(path.join("workspace.json")).unwrap(), "{corrupt json");
+        clean_profile(&path);
+    }
+
+    #[test]
+    fn migrate_legacy_favorites_once_prevents_resurrection_duplication_and_handles_errors() {
+        let path = profile("legacy-fav-once");
+        let marker = path.join(FAVORITES_MIGRATED_MARKER);
+        let legacy = vec![
+            Favorite {
+                name: "Code Review".into(),
+                text: "Old legacy text".into(),
+                when: "2026-11-20 10:00".into(),
+                uses: 1,
+            },
+            Favorite {
+                name: "Bug Report".into(),
+                text: "Include repro steps".into(),
+                when: "2026-11-20 10:05".into(),
+                uses: 0,
+            },
+        ];
+
+        // (d) read_only skips without writing marker so migration can run once workspace.json is repaired.
+        let mut favs = vec![Favorite {
+            name: "  code   review ".into(),
+            text: "Edited newer text".into(),
+            when: "2026-11-24 10:00".into(),
+            uses: 4,
+        }];
+        let ran_ro = migrate_legacy_favorites_once(&path, &mut favs, &legacy, true, |_| {
+            panic!("read_only migration must not call save");
+        })
+        .unwrap();
+        assert!(!ran_ro);
+        assert!(!marker.exists(), "read_only must not write migration marker");
+        assert_eq!(favs.len(), 1);
+
+        // (c) failed save does NOT write marker, leaves `existing` unchanged, and retries on next launch.
+        let err = migrate_legacy_favorites_once(&path, &mut favs, &legacy, false, |_| {
+            Err(io::Error::new(ErrorKind::PermissionDenied, "disk full"))
+        });
+        assert!(err.is_err());
+        assert!(!marker.exists(), "failed save must not write migration marker");
+        assert_eq!(favs.len(), 1, "failed save must leave favorites unchanged");
+
+        // Next launch succeeds: (b) edited "Code Review" is NOT duplicated by legacy copy with old text,
+        // while missing "Bug Report" is migrated once and marker is written.
+        let mut saved_calls = 0usize;
+        let migrated = migrate_legacy_favorites_once(&path, &mut favs, &legacy, false, |cand| {
+            saved_calls += 1;
+            assert_eq!(cand.len(), 2);
+            assert_eq!(cand[0].text, "Edited newer text");
+            assert_eq!(cand[1].name, "Bug Report");
+            Ok(())
+        })
+        .unwrap();
+        assert!(migrated);
+        assert_eq!(saved_calls, 1);
+        assert!(marker.exists());
+        assert_eq!(favs.len(), 2);
+        assert_eq!(favs[0].text, "Edited newer text");
+        assert_eq!(favs[1].name, "Bug Report");
+
+        // (a) Deleting the migrated favorite and restarting must NOT resurrect it.
+        favs.retain(|f| f.name != "Bug Report");
+        assert_eq!(favs.len(), 1);
+        let second = migrate_legacy_favorites_once(&path, &mut favs, &legacy, false, |_| {
+            panic!("second launch after marker must not save or resurrect deleted favorites");
+        })
+        .unwrap();
+        assert!(!second);
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0].text, "Edited newer text");
+
         clean_profile(&path);
     }
 }

@@ -727,10 +727,13 @@ pub fn load_favorites() -> Vec<Favorite> {
         .unwrap_or_default()
 }
 
-pub fn save_favorites(f: &[Favorite]) {
-    if let Ok(json) = serde_json::to_vec_pretty(f) {
-        let _ = atomic_write(&data_dir().join("favorites.json"), &json);
-    }
+pub fn save_favorites(f: &[Favorite]) -> std::io::Result<()> {
+    save_favorites_to(&data_dir().join("favorites.json"), f)
+}
+
+fn save_favorites_to(path: &Path, f: &[Favorite]) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(f).map_err(std::io::Error::other)?;
+    atomic_write(path, &json)
 }
 
 pub fn load_draft() -> String {
@@ -872,5 +875,34 @@ mod tests {
         assert!(remove_history_file(&blocker_dir).is_err(), "real remove_file error should propagate");
         std::fs::remove_dir(&blocker_dir).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_favorites_returns_error_on_write_failure_and_persists_on_success() {
+        let dir = std::env::temp_dir().join(format!("listen-rs-save-fav-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let favs = vec![Favorite {
+            name: "Standup".into(),
+            text: "Daily update".into(),
+            when: "2026-11-25 10:00".into(),
+            uses: 2,
+        }];
+
+        // Writing into a path whose target is an existing directory must return Err.
+        let dir_as_file = dir.join("favorites.dir");
+        std::fs::create_dir(&dir_as_file).unwrap();
+        assert!(save_favorites_to(&dir_as_file, &favs).is_err());
+
+        // Writing to a normal file succeeds and round-trips cleanly.
+        let file = dir.join("favorites.json");
+        save_favorites_to(&file, &favs).unwrap();
+        let loaded: Vec<Favorite> =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Standup");
+        assert_eq!(loaded[0].uses, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

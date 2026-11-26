@@ -226,8 +226,14 @@ impl ListenApp {
         let mut favorites = if preview { Vec::new() } else { storage::load_favorites() };
         if !preview {
             let legacy = workspace.legacy_favorites();
-            if crate::workspace::merge_missing_favorites(&mut favorites, &legacy) {
-                storage::save_favorites(&favorites);
+            if let Err(e) = crate::workspace::migrate_legacy_favorites_once(
+                &profile,
+                &mut favorites,
+                &legacy,
+                workspace.is_read_only(),
+                storage::save_favorites,
+            ) {
+                eprintln!("could not migrate legacy favorites: {e}");
             }
         }
         let tray = if preview {
@@ -396,8 +402,10 @@ impl ListenApp {
         let _ = std::thread::Builder::new().name("ollama-models".into()).spawn(move || {
             let (_, models_opt, available) =
                 crate::settings_bridge::local_models_response(false, &url, current);
-            core.ollama_available.store(available, Ordering::Relaxed);
-            core.emit(UiEvent::Models(models_opt.unwrap_or_default()));
+            core.emit(UiEvent::Models {
+                models: models_opt.unwrap_or_default(),
+                available,
+            });
         });
     }
 
@@ -951,26 +959,40 @@ impl ListenApp {
                 UiAction::LabPasteDraft => self.paste_draft(ctx),
                 UiAction::LabSaveFavorite(name) => {
                     let (when, _) = storage::now_stamp();
-                    match upsert_favorite(&mut self.favorites, &name, &self.lab_ui.draft, when) {
-                        Some(updated) => {
-                            if !self.preview() {
-                                storage::save_favorites(&self.favorites);
-                            }
+                    let preview = self.preview();
+                    match save_favorite_with(
+                        &mut self.favorites,
+                        &name,
+                        &self.lab_ui.draft,
+                        when,
+                        preview,
+                        storage::save_favorites,
+                    ) {
+                        Ok(Some(updated)) => {
                             self.lab_ui.save_fav_open = false;
                             self.lab_ui.save_fav_name.clear();
                             self.toast(if updated { "Updated favorite" } else { "Saved favorite" });
                         }
-                        None => {
+                        Ok(None) => {
                             self.toast("The draft is empty");
+                        }
+                        Err(msg) => {
+                            self.toast(msg);
                         }
                     }
                 }
                 UiAction::LabLoadFavorite(idx) => {
                     if let Some(f) = self.favorites.get_mut(idx) {
+                        let prev_uses = f.uses;
                         f.uses = f.uses.saturating_add(1);
                         let text = f.text.clone();
                         if !self.preview() {
-                            storage::save_favorites(&self.favorites);
+                            if let Err(e) = storage::save_favorites(&self.favorites) {
+                                if let Some(f) = self.favorites.get_mut(idx) {
+                                    f.uses = prev_uses;
+                                }
+                                eprintln!("could not save favorite use count: {e}");
+                            }
                         }
                         if !self.lab_ui.draft.trim().is_empty()
                             || self.lab_ui.candidate.is_some()
@@ -993,12 +1015,16 @@ impl ListenApp {
                     }
                 }
                 UiAction::LabDeleteFavorite(idx) => {
-                    if idx < self.favorites.len() {
-                        self.favorites.remove(idx);
-                        if !self.preview() {
-                            storage::save_favorites(&self.favorites);
-                        }
-                        self.toast("Removed favorite");
+                    let preview = self.preview();
+                    match delete_favorite_with(
+                        &mut self.favorites,
+                        idx,
+                        preview,
+                        storage::save_favorites,
+                    ) {
+                        Ok(true) => self.toast("Removed favorite"),
+                        Ok(false) => {}
+                        Err(msg) => self.toast(msg),
                     }
                 }
                 UiAction::LabRestoreArchived(id) => {
@@ -1097,8 +1123,11 @@ impl ListenApp {
                 UiAction::SetRestoreClipboard(v) => self.settings.restore_clipboard = v,
                 UiAction::SetQuietMode(v) => self.settings.quiet_mode = v,
                 UiAction::SetSpeechEngine(e) => {
-                    if self.core.meeting_active() || self.benchmarker.is_active() {
-                        self.toast("Stop the active meeting or benchmark before switching the speech engine.");
+                    if self.core.phase() != Phase::Idle
+                        || self.core.meeting_active()
+                        || self.benchmarker.is_active()
+                    {
+                        self.toast("Finish active dictation, meeting, or benchmark before switching the speech engine.");
                     } else {
                         self.settings.speech_engine = e;
                         self.persist();
@@ -1385,9 +1414,9 @@ impl ListenApp {
                     }
                     self.sync_lab_ui();
                 }
-                UiEvent::Models(m) => {
-                    self.ollama_available = resolve_ollama_available(&self.core, &m);
-                    self.models = m;
+                UiEvent::Models { models, available } => {
+                    self.ollama_available = available;
+                    self.models = models;
                 }
             }
         }
@@ -1527,9 +1556,15 @@ impl ListenApp {
                     } else if let Some(f) = self.favorites.get_mut(i) {
                         let ok = arboard::Clipboard::new().and_then(|mut c| c.set_text(f.text.clone())).is_ok();
                         if ok {
+                            let prev_uses = f.uses;
                             f.uses = f.uses.saturating_add(1);
                             let name = f.name.clone();
-                            storage::save_favorites(&self.favorites);
+                            if let Err(e) = storage::save_favorites(&self.favorites) {
+                                if let Some(f) = self.favorites.get_mut(i) {
+                                    f.uses = prev_uses;
+                                }
+                                eprintln!("could not save favorite use count: {e}");
+                            }
                             self.core.cue(audio::Cue::Copied);
                             self.toast(format!("Copied “{name}”"));
                         }
@@ -1960,8 +1995,11 @@ impl ListenApp {
                 PCmd::Cancel => self.core.send(Cmd::Cancel),
                 PCmd::PasteDraft => self.paste_draft(ctx),
                 PCmd::ReloadEngine => {
-                    if self.core.meeting_active() || self.benchmarker.is_active() {
-                        self.toast("Stop the active meeting or benchmark before reloading the speech engine.");
+                    if self.core.phase() != Phase::Idle
+                        || self.core.meeting_active()
+                        || self.benchmarker.is_active()
+                    {
+                        self.toast("Finish active dictation, meeting, or benchmark before reloading the speech engine.");
                     } else {
                         self.core.send(Cmd::ReloadEngine);
                     }
@@ -2332,8 +2370,41 @@ fn upsert_favorite(
     }
 }
 
-fn resolve_ollama_available(core: &Core, models: &[String]) -> bool {
-    core.ollama_available.load(Ordering::Relaxed) || !models.is_empty()
+fn save_favorite_with(
+    favorites: &mut Vec<Favorite>,
+    name: &str,
+    draft: &str,
+    when: String,
+    preview: bool,
+    save: impl FnOnce(&[Favorite]) -> std::io::Result<()>,
+) -> Result<Option<bool>, String> {
+    let mut candidate = favorites.clone();
+    let Some(updated) = upsert_favorite(&mut candidate, name, draft, when) else {
+        return Ok(None);
+    };
+    if !preview {
+        save(&candidate).map_err(|e| format!("Could not save favorite: {e}"))?;
+    }
+    *favorites = candidate;
+    Ok(Some(updated))
+}
+
+fn delete_favorite_with(
+    favorites: &mut Vec<Favorite>,
+    idx: usize,
+    preview: bool,
+    save: impl FnOnce(&[Favorite]) -> std::io::Result<()>,
+) -> Result<bool, String> {
+    if idx >= favorites.len() {
+        return Ok(false);
+    }
+    let mut candidate = favorites.clone();
+    candidate.remove(idx);
+    if !preview {
+        save(&candidate).map_err(|e| format!("Could not remove favorite: {e}"))?;
+    }
+    *favorites = candidate;
+    Ok(true)
 }
 
 fn should_hide_on_close(has_tray: bool, preview: bool) -> bool {
@@ -2343,14 +2414,13 @@ fn should_hide_on_close(has_tray: bool, preview: bool) -> bool {
 #[cfg(test)]
 mod close_policy_tests {
     use super::{
-        parse_assessment_view, resolve_ollama_available, should_hide_on_close,
+        delete_favorite_with, parse_assessment_view, save_favorite_with, should_hide_on_close,
         sync_meeting_ui_from_core, upsert_favorite,
     };
-    use crate::engine::Core;
+    use crate::engine::{Core, UiEvent};
     use crate::storage::{Favorite, Settings};
     use crate::ui::{MeetingUiState, SettingsSection};
     use serde_json::json;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn window_close_hides_to_tray_by_default_unless_preview_or_no_tray() {
@@ -2459,15 +2529,109 @@ mod close_policy_tests {
     }
 
     #[test]
-    fn resolve_ollama_available_preserves_reachability_with_zero_models() {
-        let (core, _) = Core::new(Settings::default(), true);
-        core.ollama_available.store(false, Ordering::Relaxed);
-        assert!(!resolve_ollama_available(&core, &[]));
-        assert!(resolve_ollama_available(&core, &["qwen3.5:2b".into()]));
+    fn save_and_delete_favorite_preserve_state_on_disk_error() {
+        let mut favs = vec![Favorite {
+            name: "Standup".into(),
+            text: "Original text".into(),
+            when: "2026-11-24 09:00".into(),
+            uses: 3,
+        }];
 
-        // Reachable Ollama with 0 installed models must remain available=true.
-        core.ollama_available.store(true, Ordering::Relaxed);
-        assert!(resolve_ollama_available(&core, &[]));
+        // Save error leaves favorites unchanged and returns Err (not success).
+        let err = save_favorite_with(
+            &mut favs,
+            "Standup",
+            "Updated text",
+            "2026-11-25 10:00".into(),
+            false,
+            |_| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "disk full")),
+        )
+        .unwrap_err();
+        assert!(err.contains("Could not save favorite"));
+        assert!(err.contains("disk full"));
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0].text, "Original text");
+
+        // Save success commits the update.
+        let updated = save_favorite_with(
+            &mut favs,
+            "Standup",
+            "Updated text",
+            "2026-11-25 10:01".into(),
+            false,
+            |cand| {
+                assert_eq!(cand[0].text, "Updated text");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(updated, Some(true));
+        assert_eq!(favs[0].text, "Updated text");
+
+        // Delete error leaves favorites unchanged and returns Err.
+        let del_err = delete_favorite_with(&mut favs, 0, false, |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only"))
+        })
+        .unwrap_err();
+        assert!(del_err.contains("read-only"));
+        assert_eq!(favs.len(), 1);
+
+        // Delete success removes the item.
+        let removed = delete_favorite_with(&mut favs, 0, false, |cand| {
+            assert!(cand.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(removed);
+        assert!(favs.is_empty());
+    }
+
+    #[test]
+    fn models_event_carries_reachability_even_with_zero_models() {
+        let mut ollama_available = false;
+        let mut models = Vec::new();
+        let apply = |avail: &mut bool, list: &mut Vec<String>, ev: UiEvent| {
+            if let UiEvent::Models { models: m, available } = ev {
+                *avail = available;
+                *list = m;
+            }
+        };
+
+        // Reachable Ollama with 0 installed models must preserve available=true.
+        apply(
+            &mut ollama_available,
+            &mut models,
+            UiEvent::Models {
+                models: Vec::new(),
+                available: true,
+            },
+        );
+        assert!(ollama_available);
+        assert!(models.is_empty());
+
+        // Reachable with installed models populates list and keeps available=true.
+        apply(
+            &mut ollama_available,
+            &mut models,
+            UiEvent::Models {
+                models: vec!["qwen3.5:2b".into()],
+                available: true,
+            },
+        );
+        assert!(ollama_available);
+        assert_eq!(models, vec!["qwen3.5:2b"]);
+
+        // Unreachable Ollama sets available=false and clears models.
+        apply(
+            &mut ollama_available,
+            &mut models,
+            UiEvent::Models {
+                models: Vec::new(),
+                available: false,
+            },
+        );
+        assert!(!ollama_available);
+        assert!(models.is_empty());
 
         // Dead learned preferences keyword removed from Prompt Lab settings section.
         assert!(!SettingsSection::PromptLab.keywords().contains("learned"));
