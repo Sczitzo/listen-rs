@@ -1123,7 +1123,9 @@ impl ListenApp {
                 UiAction::SetRestoreClipboard(v) => self.settings.restore_clipboard = v,
                 UiAction::SetQuietMode(v) => self.settings.quiet_mode = v,
                 UiAction::SetSpeechEngine(e) => {
-                    if self.core.phase() != Phase::Idle
+                    if self.core.engine_loading() || matches!(self.snap.engine, EngineState::Loading) {
+                        self.toast("Wait for the speech model to finish loading before switching the speech engine.");
+                    } else if self.core.phase() != Phase::Idle
                         || self.core.meeting_active()
                         || self.benchmarker.is_active()
                     {
@@ -1152,8 +1154,13 @@ impl ListenApp {
                     }
                 }
                 UiAction::SelectSpeechModel(id) => {
-                    if self.core.meeting_active() || self.benchmarker.is_active() {
-                        self.toast("Stop the active meeting or benchmark before switching speech models.");
+                    if self.core.engine_loading() || matches!(self.snap.engine, EngineState::Loading) {
+                        self.toast("Wait for the speech model to finish loading before switching speech models.");
+                    } else if self.core.phase() != Phase::Idle
+                        || self.core.meeting_active()
+                        || self.benchmarker.is_active()
+                    {
+                        self.toast("Finish active dictation, meeting, or benchmark before switching speech models.");
                     } else {
                         self.persist();
                         let ok = crate::settings_bridge::call(&self.core, "set_setting", &[json!("speech_model"), json!(id)])
@@ -1995,7 +2002,9 @@ impl ListenApp {
                 PCmd::Cancel => self.core.send(Cmd::Cancel),
                 PCmd::PasteDraft => self.paste_draft(ctx),
                 PCmd::ReloadEngine => {
-                    if self.core.phase() != Phase::Idle
+                    if self.core.engine_loading() || matches!(self.snap.engine, EngineState::Loading) {
+                        self.toast("The speech model is already loading.");
+                    } else if self.core.phase() != Phase::Idle
                         || self.core.meeting_active()
                         || self.benchmarker.is_active()
                     {

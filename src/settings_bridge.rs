@@ -203,9 +203,7 @@ fn set_setting(core: &Core, key: &str, value: &Value) -> bool {
     {
         return false;
     }
-    if key == "speech_model"
-        && (core.meeting_active() || core.benchmark_active.load(Ordering::Relaxed))
-    {
+    if key == "speech_model" && !core.can_reload_engine() {
         return false;
     }
     let checked = match key {

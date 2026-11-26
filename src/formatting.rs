@@ -44,7 +44,7 @@ static NEWLINE_CMD: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCRATCH_CMD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*[.!?]\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*[,.;!?]?[ \t]*)",
+        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*[.!?]+\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*[,.;!?]?[ \t]*)",
     )
     .unwrap()
 });
@@ -824,6 +824,19 @@ fn can_reconcile_vocab(raw_span: &str, vocab_term: &str) -> Option<(bool, usize)
         return None;
     }
     if rn == vn {
+        if (raw_span.starts_with('-') && !vocab_term.starts_with('-'))
+            || (raw_span.ends_with('-') && !vocab_term.ends_with('-'))
+            || ARROW.is_match(raw_span)
+            || raw_span.split_whitespace().any(|tok| tok == "-")
+            || (raw_span.contains("--") && !vocab_term.contains("--"))
+            || OPERATOR.find_iter(raw_span).any(|m| {
+                m.as_str().chars().any(|c| !matches!(c, '.' | '-' | '_'))
+            })
+            || (technical_literals(raw_span).next().is_some()
+                && technical_literals(vocab_term).next().is_none())
+        {
+            return None;
+        }
         return Some((true, 0));
     }
     let vlen = vn.chars().count();
@@ -1221,6 +1234,74 @@ fn preserves_triggers(raw: &str, formatted: &str, preserved_triggers: &[&str]) -
     true
 }
 
+fn is_sentence_exclamation(text: &str, m: regex::Match<'_>) -> bool {
+    if m.as_str() != "!" {
+        return false;
+    }
+    let prev = text[..m.start()].chars().next_back();
+    let next = text[m.end()..].chars().next();
+    let prev_ok = prev.is_some_and(|c| {
+        c.is_alphanumeric() || matches!(c, ')' | ']' | '"' | '\'' | '”' | '’')
+    });
+    let next_ok = next.is_none_or(char::is_whitespace);
+    prev_ok && next_ok
+}
+
+fn operator_segments_match_tighten(source: &str, content: &str) -> bool {
+    let src_ops: Vec<_> = OPERATOR.find_iter(source).collect();
+    let cnt_ops: Vec<_> = OPERATOR.find_iter(content).collect();
+    if src_ops.len() != cnt_ops.len()
+        || !src_ops
+            .iter()
+            .zip(cnt_ops.iter())
+            .all(|(a, b)| a.as_str() == b.as_str())
+    {
+        return false;
+    }
+    let seg_words = |seg: &str| -> Vec<String> {
+        let mut w = expand_contractions(&words(seg));
+        w.retain(|tok| !filler(tok));
+        w
+    };
+    let split_segs = |text: &str, ops: &[regex::Match<'_>]| -> Vec<Vec<String>> {
+        let mut out = Vec::with_capacity(ops.len() + 1);
+        let mut pos = 0;
+        for op in ops {
+            out.push(seg_words(&text[pos..op.start()]));
+            pos = op.end();
+        }
+        out.push(seg_words(&text[pos..]));
+        out
+    };
+    let src_segs = split_segs(source, &src_ops);
+    let cnt_segs = split_segs(content, &cnt_ops);
+    for (i, (s, c)) in src_segs.iter().zip(cnt_segs.iter()).enumerate() {
+        if !is_ordered_subsequence(c, s) {
+            return false;
+        }
+        if !s.is_empty() && c.is_empty() {
+            return false;
+        }
+        if i < src_ops.len() && !s.is_empty() && !is_sentence_exclamation(source, src_ops[i]) {
+            if c.last() != s.last() {
+                return false;
+            }
+        }
+        if i > 0 && !s.is_empty() {
+            let prev_op = src_ops[i - 1];
+            if is_sentence_exclamation(source, prev_op) {
+                let s_trimmed_empty = s.iter().all(|w| is_tighten_filler(w));
+                if !s_trimmed_empty && c.is_empty() {
+                    return false;
+                }
+            } else if c.first() != s.first() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn is_tighten_filler(w: &str) -> bool {
     matches!(
         w,
@@ -1349,25 +1430,9 @@ fn is_safe_tighten(
         return false;
     }
     if OPERATOR.is_match(src) {
-        let src_segs: Vec<Vec<String>> = OPERATOR
-            .split(src)
-            .map(|seg| expand_contractions(&words(seg)))
-            .collect();
-        let cnt_segs: Vec<Vec<String>> = OPERATOR
-            .split(&content)
-            .map(|seg| expand_contractions(&words(seg)))
-            .collect();
-        if src_segs.len() != cnt_segs.len()
-            || !src_segs
-                .iter()
-                .zip(cnt_segs.iter())
-                .enumerate()
-                .all(|(i, (s, c))| {
-                    is_ordered_subsequence(c, s)
-                        && (s.is_empty() || !c.is_empty())
-                        && (i + 1 >= src_segs.len() || s.is_empty() || c.last() == s.last())
-                        && (i == 0 || s.is_empty() || c.first() == s.first())
-                })
+        let clean_src = without_comma_fillers(src);
+        if !operator_segments_match_tighten(src, &content)
+            && !operator_segments_match_tighten(&clean_src, &content)
         {
             return false;
         }
@@ -4101,5 +4166,94 @@ mod tests {
         assert!(!exec_mid.discarded);
         assert!(exec_mid.locally_edited);
         assert_eq!(exec_mid.corrected, "Send it to Alice.");
+    }
+
+    #[test]
+    fn style_tighten_allows_filler_removal_next_to_operators_and_exclamations() {
+        assert!(is_safe_for_style(
+            "Great! Um, let's ship it",
+            "Great! Let's ship it.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(is_safe_for_style(
+            "It costs, um, $50",
+            "It costs $50.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(is_safe_for_style(
+            "It costs, you know, $50",
+            "It costs $50.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(is_safe_for_style(
+            "Check (um, the logs)",
+            "Check (the logs)",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(is_safe_for_style(
+            "Check if x <= uh y",
+            "Check if x <= y",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(is_safe_for_style(
+            "We shipped it! So I basically want to celebrate",
+            "We shipped it! I want to celebrate.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        // Unary !ident and != still pin their adjacent operands.
+        assert!(!is_safe_for_style(
+            "Check !flag before exit",
+            "Check ! before exit",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(!is_safe_for_style(
+            "Check if x != y before exit",
+            "Check if x != before exit",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn vocab_reconciliation_never_bypasses_flags_operators_or_technical_literals() {
+        assert!(!is_safe("pass --config", "pass Config", "Config"));
+        assert!(!is_safe("compute x - y", "compute xy", "xy"));
+        assert!(!is_safe("open config.json", "open ConfigJSON", "ConfigJSON"));
+        assert!(!is_safe("use -v5", "use v5", "v5"));
+        // Legitimate vocab normalization remains accepted.
+        assert!(is_safe("open claude.md", "open CLAUDE.md", "CLAUDE.md"));
+        assert!(is_safe("open claude md", "open CLAUDE.md", "CLAUDE.md"));
+        assert!(is_safe("use open code", "use OpenCode", "OpenCode"));
+    }
+
+    #[test]
+    fn scratch_command_handles_repeated_terminal_punctuation() {
+        let exclam = prepare_dictation("No way!! Scratch that.", "");
+        assert!(exclam.discarded);
+        assert_eq!(exclam.corrected, "");
+
+        let interrobang = prepare_dictation("Are you sure?! Scratch that.", "");
+        assert!(interrobang.discarded);
+        assert_eq!(interrobang.corrected, "");
+
+        let second = prepare_dictation("Hi Alice. Wait?! Scratch that.", "");
+        assert!(!second.discarded);
+        assert!(second.locally_edited);
+        assert_eq!(second.corrected, "Hi Alice.");
     }
 }

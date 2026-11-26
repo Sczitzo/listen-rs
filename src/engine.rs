@@ -199,6 +199,7 @@ pub struct Core {
     pub capture_paused: std::sync::atomic::AtomicBool,
     pub draft_delivery_pending: AtomicBool,
     pub benchmark_active: AtomicBool,
+    pub(crate) engine_loading: AtomicBool,
     #[cfg(windows)]
     pub controller_capture: Mutex<Option<crate::controller::Capture>>,
     tx: Sender<Cmd>,
@@ -268,6 +269,7 @@ impl Core {
             capture_paused: std::sync::atomic::AtomicBool::new(false),
             draft_delivery_pending: AtomicBool::new(false),
             benchmark_active: AtomicBool::new(false),
+            engine_loading: AtomicBool::new(false),
             #[cfg(windows)]
             controller_capture: Mutex::new(None),
             tx,
@@ -288,10 +290,50 @@ impl Core {
         m.active || m.transcribing
     }
 
+    pub fn engine_loading(&self) -> bool {
+        self.engine_loading.load(Ordering::Acquire)
+    }
+
     pub(crate) fn can_reload_engine(&self) -> bool {
-        self.phase() == Phase::Idle
+        !self.engine_loading.load(Ordering::Acquire)
+            && self.phase() == Phase::Idle
             && !self.meeting_active()
             && !self.benchmark_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_engine_reload(self: &Arc<Self>) -> Option<EngineLoadClaim> {
+        if self
+            .engine_loading
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        if self.phase() != Phase::Idle
+            || self.meeting_active()
+            || self.benchmark_active.load(Ordering::Acquire)
+        {
+            self.engine_loading.store(false, Ordering::Release);
+            return None;
+        }
+        let (prev_engine, prev_status) = {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.phase != Phase::Idle {
+                drop(sh);
+                self.engine_loading.store(false, Ordering::Release);
+                return None;
+            }
+            let prev = (sh.engine.clone(), sh.status.clone());
+            sh.engine = EngineState::Loading;
+            sh.status = "Loading the speech model…".into();
+            prev
+        };
+        self.repaint();
+        Some(EngineLoadClaim {
+            core: self.clone(),
+            prev_engine,
+            prev_status,
+        })
     }
 
     pub fn meeting_snapshot(&self) -> serde_json::Value {
@@ -934,36 +976,35 @@ fn live_preview(core: Arc<Core>, tap: audio::LiveTap, gen: u64, quiet_mode: bool
     }
 }
 
-fn load_engine(core: &Arc<Core>) {
-    load_engine_with(core, || {}, speech::load);
+pub(crate) struct EngineLoadClaim {
+    core: Arc<Core>,
+    prev_engine: EngineState,
+    prev_status: String,
 }
 
-fn load_engine_with<B, L>(core: &Arc<Core>, before_recheck: B, loader: L) -> bool
+impl Drop for EngineLoadClaim {
+    fn drop(&mut self) {
+        self.core.engine_loading.store(false, Ordering::Release);
+    }
+}
+
+fn run_claimed_engine_load<B, L>(claim: EngineLoadClaim, before_recheck: B, loader: L) -> bool
 where
     B: FnOnce(),
     L: FnOnce(&Settings) -> Result<Speech, String>,
 {
-    if !core.can_reload_engine() {
-        return false;
-    }
+    let core = claim.core.clone();
     let s = core.settings();
-    let (prev_engine, prev_status) = {
-        let mut sh = core.shared.lock().unwrap();
-        if sh.phase != Phase::Idle {
-            return false;
-        }
-        let prev = (sh.engine.clone(), sh.status.clone());
-        sh.engine = EngineState::Loading;
-        sh.status = "Loading the speech model…".into();
-        prev
-    };
-    core.repaint();
     before_recheck();
-    if !core.can_reload_engine() {
+    let still_idle = core.phase() == Phase::Idle
+        && !core.meeting_active()
+        && !core.benchmark_active.load(Ordering::Acquire);
+    if !still_idle {
         let mut sh = core.shared.lock().unwrap();
-        sh.engine = prev_engine;
-        sh.status = prev_status;
+        sh.engine = claim.prev_engine.clone();
+        sh.status = claim.prev_status.clone();
         drop(sh);
+        drop(claim);
         core.repaint();
         return false;
     }
@@ -982,6 +1023,7 @@ where
         };
         sh.engine = state;
         drop(sh);
+        drop(claim);
         core.repaint();
         return true;
     }
@@ -1002,8 +1044,21 @@ where
             sh.engine = EngineState::Unavailable(e);
         }
     }
+    drop(claim);
     core.repaint();
     true
+}
+
+#[cfg(test)]
+fn load_engine_with<B, L>(core: &Arc<Core>, before_recheck: B, loader: L) -> bool
+where
+    B: FnOnce(),
+    L: FnOnce(&Settings) -> Result<Speech, String>,
+{
+    let Some(claim) = core.begin_engine_reload() else {
+        return false;
+    };
+    run_claimed_engine_load(claim, before_recheck, loader)
 }
 
 struct ActiveCommand {
@@ -1848,9 +1903,8 @@ where
 }
 
 fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
-    {
-        let c = core.clone();
-        std::thread::spawn(move || load_engine(&c));
+    if let Some(claim) = core.begin_engine_reload() {
+        std::thread::spawn(move || run_claimed_engine_load(claim, || {}, speech::load));
     }
     if !core.preview {
         crate::winput::prewarm_clipboard();
@@ -2531,12 +2585,16 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                 core.draft_delivery_pending.store(false, Ordering::Release);
             }
             Cmd::ReloadEngine => {
-                if !core.can_reload_engine() {
-                    core.set_status("Cannot reload the speech engine while dictation, a meeting, or a benchmark is active.");
+                let Some(claim) = core.begin_engine_reload() else {
+                    let msg = if core.engine_loading() {
+                        "The speech model is already loading."
+                    } else {
+                        "Cannot reload the speech engine while dictation, a meeting, or a benchmark is active."
+                    };
+                    core.set_status(msg);
                     continue;
-                }
-                let c = core.clone();
-                std::thread::spawn(move || load_engine(&c));
+                };
+                std::thread::spawn(move || run_claimed_engine_load(claim, || {}, speech::load));
             }
             Cmd::RefreshModels => {
                 let c = core.clone();
@@ -4735,6 +4793,41 @@ mod tests {
             sh.engine
         );
         assert_eq!(sh.status, "Ready.");
+        drop(sh);
+        assert!(
+            !core.engine_loading(),
+            "aborted reload must release engine_loading flag"
+        );
+        core.meeting.lock().unwrap().active = false;
+        assert!(core.can_reload_engine());
+
+        // Synchronous claim prevents concurrent/overlapping reloads and immediately
+        // exposes EngineState::Loading so subsequent commands cannot start mid-reload.
+        let claim = core
+            .begin_engine_reload()
+            .expect("first reload claim must succeed");
+        assert!(core.engine_loading());
+        assert!(!core.can_reload_engine());
+        assert!(matches!(
+            core.shared.lock().unwrap().engine,
+            EngineState::Loading
+        ));
+        assert!(
+            core.begin_engine_reload().is_none(),
+            "overlapping reload must be rejected while a reload is in flight"
+        );
+        // Simulate abort while claimed: restores Ready and clears engine_loading.
+        core.benchmark_active.store(true, Ordering::Release);
+        assert!(!run_claimed_engine_load(
+            claim,
+            || {},
+            |_| panic!("aborted reload must not load speech engine"),
+        ));
+        assert!(!core.engine_loading());
+        assert!(matches!(
+            &core.shared.lock().unwrap().engine,
+            EngineState::Ready(label) if label == "Parakeet"
+        ));
     }
 
     #[test]
@@ -4788,6 +4881,7 @@ mod tests {
             capture_paused: AtomicBool::new(false),
             draft_delivery_pending: AtomicBool::new(false),
             benchmark_active: AtomicBool::new(false),
+            engine_loading: AtomicBool::new(false),
             #[cfg(windows)]
             controller_capture: Mutex::new(None),
             tx,
