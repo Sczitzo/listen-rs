@@ -2,7 +2,7 @@ use crate::cleanup::{self, ResolvedTarget};
 use crate::storage::{self, Favorite, PromptTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -43,11 +43,145 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn extract_gap_from_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    ["issue", "gap", "text", "description"]
+        .iter()
+        .find_map(|key| {
+            map.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn deserialize_gaps<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    match value {
+        Value::Null => {}
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_owned());
+            }
+        }
+        Value::Object(map) => {
+            if let Some(gap) = extract_gap_from_object(&map) {
+                out.push(gap);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            out.push(trimmed.to_owned());
+                        }
+                    }
+                    Value::Object(map) => {
+                        if let Some(gap) = extract_gap_from_object(&map) {
+                            out.push(gap);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+fn strip_think_blocks(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<think>") {
+        let open = pos + rel;
+        out.push_str(&input[pos..open]);
+        let after_open = open + "<think>".len();
+        if let Some(close_rel) = lower[after_open..].find("</think>") {
+            pos = after_open + close_rel + "</think>".len();
+        } else {
+            return out;
+        }
+    }
+    out.push_str(&input[pos..]);
+    out
+}
+
+fn extract_fenced_blocks(text: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel_open) = text[cursor..].find("```") {
+        let open = cursor + rel_open;
+        let after_ticks = &text[open + 3..];
+        let (body_start_rel, inline_close) = match after_ticks.find('\n') {
+            Some(nl) => {
+                let info = &after_ticks[..nl];
+                if let Some(c) = info.find("```") {
+                    (0, Some(c))
+                } else {
+                    (nl + 1, None)
+                }
+            }
+            None => (0, after_ticks.find("```")),
+        };
+        if let Some(close_rel) = inline_close {
+            let block = after_ticks[..close_rel].trim();
+            if !block.is_empty() {
+                blocks.push(block);
+            }
+            cursor = open + 3 + close_rel + 3;
+            continue;
+        }
+        let body_start = open + 3 + body_start_rel;
+        let rest = &text[body_start..];
+        let mut line_close: Option<(usize, usize)> = None;
+        let mut line_offset = 0;
+        for line in rest.split_inclusive('\n') {
+            if line.trim_start().starts_with("```") {
+                let ticks_rel = line.find("```").unwrap();
+                line_close = Some((line_offset, line_offset + ticks_rel + 3));
+                break;
+            }
+            line_offset += line.len();
+        }
+        if let Some((close_body_end, next_cursor_rel)) = line_close {
+            let block = rest[..close_body_end].trim();
+            if !block.is_empty() {
+                blocks.push(block);
+            }
+            cursor = body_start + next_cursor_rel;
+        } else if let Some(close_rel) = rest.find("```") {
+            let block = rest[..close_rel].trim();
+            if !block.is_empty() {
+                blocks.push(block);
+            }
+            cursor = body_start + close_rel + 3;
+        } else {
+            let block = rest.trim();
+            if !block.is_empty() {
+                blocks.push(block);
+            }
+            break;
+        }
+    }
+    blocks
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct Assessment {
     score: f64,
     criteria: BTreeMap<String, f64>,
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "deserialize_gaps")]
     gaps: Vec<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     improved: String,
@@ -58,21 +192,24 @@ struct Assessment {
 }
 
 impl Assessment {
-    fn parse(output: &str, by: String, id: u64) -> Option<Self> {
-        let trimmed = output.trim();
-        let unfenced = if let Some(rest) = trimmed.strip_prefix("```") {
-            let after_lang = rest.find('\n').map_or(rest, |idx| &rest[idx + 1..]);
-            after_lang.trim().strip_suffix("```").unwrap_or(after_lang).trim()
-        } else {
-            trimmed
-        };
-        let parsed = serde_json::from_str::<Self>(unfenced).ok().or_else(|| {
-            let start = unfenced.find('{')?;
-            let end = unfenced.rfind('}')?;
+    fn parse_json_candidate(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        serde_json::from_str::<Self>(trimmed).ok().or_else(|| {
+            let start = trimmed.find('{')?;
+            let end = trimmed.rfind('}')?;
             (start < end)
-                .then(|| serde_json::from_str::<Self>(&unfenced[start..=end]).ok())
+                .then(|| serde_json::from_str::<Self>(&trimmed[start..=end]).ok())
                 .flatten()
-        });
+        })
+    }
+
+    fn parse(output: &str, by: String, id: u64) -> Option<Self> {
+        let stripped = strip_think_blocks(output);
+        let trimmed = stripped.trim();
+        let parsed = extract_fenced_blocks(trimmed)
+            .into_iter()
+            .find_map(Self::parse_json_candidate)
+            .or_else(|| Self::parse_json_candidate(trimmed));
         let mut result = parsed?;
         if !(1.0..=10.0).contains(&result.score)
             || !REQUIRED_CRITERIA.iter().all(|key| {
@@ -488,6 +625,14 @@ impl Workspace {
 
     pub fn busy(&self) -> bool {
         self.local.is_some()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn legacy_favorites(&self) -> Vec<Favorite> {
+        self.state.favorites.clone()
     }
 
     fn prepared_pass(&self) -> Option<&PreparedPass> {
@@ -1305,6 +1450,45 @@ impl Workspace {
     }
 }
 
+fn normalized_favorite_key(fav: &Favorite) -> (String, String) {
+    let name = fav
+        .name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let text = fav
+        .text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_owned();
+    (name, text)
+}
+
+/// Non-destructively merges favorites from `legacy` that are missing from `existing`
+/// (matched by normalized name + text), never duplicating and returning `true` if any were added.
+pub fn merge_missing_favorites(existing: &mut Vec<Favorite>, legacy: &[Favorite]) -> bool {
+    let mut seen: HashSet<(String, String)> = existing
+        .iter()
+        .map(normalized_favorite_key)
+        .collect();
+    let mut added = false;
+    for fav in legacy {
+        let name = fav.name.trim();
+        if name.is_empty() || fav.text.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(normalized_favorite_key(fav)) {
+            let mut item = fav.clone();
+            item.name = name.to_owned();
+            existing.push(item);
+            added = true;
+        }
+    }
+    added
+}
+
 fn migrate_legacy(profile: &Path) -> io::Result<State> {
     let mut state = State::default();
     match fs::read_to_string(profile.join("draft.txt")) {
@@ -1706,5 +1890,114 @@ mod tests {
             10,
         ).unwrap();
         assert_eq!(genuinely_low.score, 4.0);
+    }
+
+    #[test]
+    fn assessment_parse_handles_think_midtext_fences_with_braces_and_object_null_gaps() {
+        // 1. Case-insensitive multiple <think> blocks (with braces inside), stray prose {braces}
+        //    outside a mid-text ```json fence, and mixed gaps (null, string, object variants).
+        let raw = concat!(
+            "<THINK>Draft mentions {placeholder} and {foo}. Let's score carefully.</THINK>\n",
+            "Note: avoid unescaped {braces} in templates.\n",
+            "<think>Double-checking criteria...</think>\n",
+            "```json\n",
+            "{\n",
+            "  \"score\": 8,\n",
+            "  \"criteria\": {\"clarity\": 4, \"context\": 4, \"task\": 4, \"constraints\": 4, \"success_criteria\": 4, \"format\": 4},\n",
+            "  \"gaps\": [\n",
+            "    null,\n",
+            "    \"Clarify target file\",\n",
+            "    {\"issue\": \"Add verification command\"},\n",
+            "    {\"gap\": \"Specify timeout\"},\n",
+            "    {\"text\": \"State rollback rule\"},\n",
+            "    {\"description\": \"Include edge cases\"},\n",
+            "    {\"unrelated\": 123}\n",
+            "  ],\n",
+            "  \"improved\": \"Use {braces} cleanly.\"\n",
+            "}\n",
+            "```\n",
+            "Hope {this} review helps!\n",
+            "<think>unfinished trailing thought {without closing tag"
+        );
+        let parsed = Assessment::parse(raw, "Checker".into(), 42).expect("parse fenced json with think & braces");
+        assert_eq!(parsed.score, 8.0);
+        assert_eq!(
+            parsed.gaps,
+            vec![
+                "Clarify target file",
+                "Add verification command",
+                "Specify timeout",
+                "State rollback rule",
+                "Include edge cases",
+            ]
+        );
+        assert_eq!(parsed.improved, "Use {braces} cleanly.");
+
+        // 2. Single string `gaps` and plain ``` fence (no language tag) surrounded by prose braces.
+        let string_gap = "Prose with {a} before:\n```\n{\"score\": 7, \"criteria\": {\"clarity\": 4, \"context\": 3, \"task\": 4, \"constraints\": 3, \"success_criteria\": 3, \"format\": 4}, \"gaps\": \"Add concrete output format\", \"improved\": \"\"}\n```\nAnd {b} after.";
+        let parsed_str = Assessment::parse(string_gap, "Checker".into(), 43).expect("parse string gaps");
+        assert_eq!(parsed_str.score, 7.0);
+        assert_eq!(parsed_str.gaps, vec!["Add concrete output format"]);
+
+        // 3. Missing `gaps` field and unclosed trailing <think> block after raw JSON.
+        let missing_gaps = "{\"score\": 9, \"criteria\": {\"clarity\": 5, \"context\": 4, \"task\": 5, \"constraints\": 4, \"success_criteria\": 5, \"format\": 4}}\n<THINK>trailing thoughts {bad json";
+        let parsed_missing = Assessment::parse(missing_gaps, "Checker".into(), 44).expect("parse missing gaps");
+        assert_eq!(parsed_missing.score, 9.0);
+        assert!(parsed_missing.gaps.is_empty());
+    }
+
+    #[test]
+    fn legacy_workspace_favorites_merge_is_nondestructive_and_respects_read_only() {
+        let path = profile("legacy-fav-merge");
+        let mut w = Workspace::load(&path);
+        assert!(!w.is_read_only());
+        assert_eq!(w.save_favorite(Some("Code Review"), Some("Check edge cases\nRun tests"), Some(false)), "saved");
+        assert_eq!(w.save_favorite(Some("Bug Report"), Some("Include repro steps"), Some(false)), "saved");
+
+        let ws_bytes_before = fs::read(path.join("workspace.json")).unwrap();
+        let reopened = Workspace::load(&path);
+        assert!(!reopened.is_read_only());
+        let legacy = reopened.legacy_favorites();
+        assert_eq!(legacy.len(), 2);
+
+        // Existing favorites.json already has "Code Review" (differing only in casing/whitespace/CRLF)
+        // plus a user-authored favorite that must stay untouched.
+        let mut existing = vec![
+            Favorite {
+                name: "  code  review ".into(),
+                text: "Check edge cases\r\nRun tests  ".into(),
+                when: "2026-11-20 10:00".into(),
+                uses: 5,
+            },
+            Favorite {
+                name: "Keep Mine".into(),
+                text: "Never overwrite this".into(),
+                when: "2026-11-21 10:00".into(),
+                uses: 2,
+            },
+        ];
+
+        assert!(merge_missing_favorites(&mut existing, &legacy));
+        assert_eq!(existing.len(), 3);
+        assert_eq!(existing[0].name, "  code  review ");
+        assert_eq!(existing[0].uses, 5);
+        assert_eq!(existing[1].name, "Keep Mine");
+        assert_eq!(existing[2].name, "Bug Report");
+        assert_eq!(existing[2].text, "Include repro steps");
+
+        // Second merge is idempotent and returns false.
+        assert!(!merge_missing_favorites(&mut existing, &legacy));
+        assert_eq!(existing.len(), 3);
+
+        // workspace.json was never modified by reading legacy favorites.
+        assert_eq!(fs::read(path.join("workspace.json")).unwrap(), ws_bytes_before);
+
+        // Corrupt workspace.json enters read-only mode, returns no legacy favorites, and preserves file untouched.
+        fs::write(path.join("workspace.json"), "{corrupt json").unwrap();
+        let corrupt = Workspace::load(&path);
+        assert!(corrupt.is_read_only());
+        assert!(corrupt.legacy_favorites().is_empty());
+        assert_eq!(fs::read_to_string(path.join("workspace.json")).unwrap(), "{corrupt json");
+        clean_profile(&path);
     }
 }

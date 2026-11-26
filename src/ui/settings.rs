@@ -288,7 +288,7 @@ fn render_section_content(
         SettingsSection::VoiceAi => render_voice_ai(ui, p, view, state, actions),
         SettingsSection::Snippets => render_snippets(ui, p, view, state, actions),
         SettingsSection::Appearance => render_appearance(ui, p, view, actions),
-        SettingsSection::PromptLab => render_prompt_lab(ui, p, view, state, actions),
+        SettingsSection::PromptLab => render_prompt_lab(ui, p, view, actions),
         SettingsSection::System => render_system(ui, p, view, state, actions),
     }
 }
@@ -1333,7 +1333,6 @@ fn render_prompt_lab(
     ui: &mut Ui,
     p: &Palette,
     view: &UiView<'_>,
-    state: &mut SettingsUiState,
     actions: &mut Vec<UiAction>,
 ) {
     // Card 1: Target & Providers
@@ -1515,71 +1514,6 @@ fn render_prompt_lab(
             render_env_key_badge(ui, p, "OPENAI_API_KEY", has_openai);
             render_env_key_badge(ui, p, "GEMINI_API_KEY", has_gemini);
         });
-    });
-
-    ui.add_space(12.0);
-
-    // Card 3: Learned preferences
-    widgets::card_frame(p).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new("Learned preferences")
-                .size(15.0)
-                .strong()
-                .color(p.fg),
-        );
-        ui.add_space(8.0);
-
-        let mut learn = view.settings.learn;
-        setting_row(
-            ui,
-            p,
-            "Use what Listen learns",
-            Some("Remember recurring phrasing and prompt preferences locally."),
-            |ui| {
-                if widgets::pill_toggle(ui, p, &mut learn).changed() {
-                    actions.push(UiAction::SetLearn(learn));
-                }
-            },
-        );
-
-        ui.add_space(8.0);
-        widgets::hline(ui, p);
-        ui.add_space(8.0);
-
-        if state.learned_lines.is_empty() && state.learned_snippet.trim().is_empty() {
-            ui.label(
-                RichText::new("No learned preferences recorded yet.")
-                    .size(12.5)
-                    .color(p.muted),
-            );
-        } else {
-            for line in &state.learned_lines {
-                ui.label(RichText::new(format!("• {line}")).size(12.5).color(p.fg));
-            }
-            if !state.learned_snippet.trim().is_empty() {
-                ui.add_space(6.0);
-                Frame::default()
-                    .fill(p.bg)
-                    .stroke(Stroke::new(1.0_f32, p.line.gamma_multiply(0.5)))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new(&state.learned_snippet)
-                                .size(12.0)
-                                .monospace()
-                                .color(p.muted),
-                        );
-                    });
-            }
-        }
-
-        ui.add_space(10.0);
-        if widgets::danger_btn(ui, p, "Forget learned preferences", true).clicked() {
-            actions.push(UiAction::ResetLearned);
-        }
     });
 }
 

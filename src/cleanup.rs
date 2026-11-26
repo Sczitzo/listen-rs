@@ -213,13 +213,20 @@ fn friendly(e: ureq::Error) -> String {
 }
 
 fn strip_think(s: &str) -> String {
-    let mut out = s.to_string();
-    while let (Some(a), Some(b)) = (out.find("<think>"), out.find("</think>")) {
-        if b < a {
-            break;
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<think>") {
+        let open = pos + rel;
+        out.push_str(&s[pos..open]);
+        let after_open = open + "<think>".len();
+        if let Some(close_rel) = lower[after_open..].find("</think>") {
+            pos = after_open + close_rel + "</think>".len();
+        } else {
+            return out.trim().to_string();
         }
-        out.replace_range(a..b + "</think>".len(), "");
     }
+    out.push_str(&s[pos..]);
     out.trim().to_string()
 }
 
@@ -512,28 +519,50 @@ fn windows_user_env(_: &str) -> Option<String> {
     None
 }
 
-fn claude_request(key: &str, model: &str, system: &str, prompt: &str, timeout: Duration) -> Result<String, String> {
+const CLAUDE_JSON_REINFORCEMENT: &str =
+    "Return ONLY a single valid raw JSON object with no markdown code fences, prose, or extra text before or after the JSON object.";
+
+fn claude_request_payload(model: &str, system: &str, prompt: &str, json_output: bool) -> Value {
+    let effective_system = if json_output {
+        if system.trim().is_empty() {
+            CLAUDE_JSON_REINFORCEMENT.to_owned()
+        } else {
+            format!("{}\n\n{CLAUDE_JSON_REINFORCEMENT}", system.trim_end())
+        }
+    } else {
+        system.to_owned()
+    };
+    json!({
+        "model": model,
+        "max_tokens": 4096,
+        "system": effective_system,
+        "messages": [{ "role": "user", "content": prompt }]
+    })
+}
+
+fn extract_claude_text(v: &Value) -> Result<String, String> {
+    let raw = v["content"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join(""))
+        .unwrap_or_default();
+    let text = strip_think(&raw);
+    if text.is_empty() {
+        Err("Claude returned nothing".into())
+    } else {
+        Ok(text)
+    }
+}
+
+fn claude_request(key: &str, model: &str, system: &str, prompt: &str, timeout: Duration, json_output: bool) -> Result<String, String> {
+    let payload = claude_request_payload(model, system, prompt, json_output);
     let resp = local_agent().post("https://api.anthropic.com/v1/messages")
         .timeout(timeout)
         .set("x-api-key", key)
         .set("anthropic-version", "2023-06-01")
-        .send_json(json!({
-            "model": model,
-            "max_tokens": 4096,
-            "system": system,
-            "messages": [{ "role": "user", "content": prompt }]
-        }))
+        .send_json(payload)
         .map_err(|error| cloud_error(PromptProvider::Anthropic, error))?;
     let v: Value = resp.into_json().map_err(|_| "Claude returned an unreadable response")?;
-    let text = v["content"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join(""))
-        .unwrap_or_default();
-    if text.trim().is_empty() {
-        Err("Claude returned nothing".into())
-    } else {
-        Ok(text.trim().to_string())
-    }
+    extract_claude_text(&v)
 }
 
 fn cloud_error(provider: PromptProvider, error: ureq::Error) -> String {
@@ -591,7 +620,7 @@ pub fn run_prompt_stage(
         return Err("The paid request could not be authorized or recorded. Your draft is still saved.".into());
     }
     if provider == PromptProvider::Anthropic {
-        return claude_request(&key, model, system, user_prompt, LAB_TIMEOUT);
+        return claude_request(&key, model, system, user_prompt, LAB_TIMEOUT, json_output);
     }
     let agent = local_agent();
     let (request, body) = match provider {
@@ -676,14 +705,26 @@ pub fn clean_dictation_with_tone(
     )
 }
 
+fn command_mode_system_prompt(vocab: &str) -> String {
+    let mut system = String::from(crate::command_mode::command_system_prompt());
+    let words = crate::storage::vocab_words(vocab);
+    if !words.is_empty() {
+        system.push_str(&format!(
+            " Spell these words exactly like this when they occur: {}.",
+            words.join(", ")
+        ));
+    }
+    system
+}
+
 /// Transform highlighted text using a spoken Command Mode instruction via local Ollama.
 pub fn run_command_mode(s: &Settings, selected: &str, voice_command: &str) -> Result<String, String> {
-    let system = crate::command_mode::command_system_prompt();
+    let system = command_mode_system_prompt(&s.vocab);
     let prompt = crate::command_mode::build_command_user_prompt(selected, voice_command);
     let raw = ollama_chat(
         &s.ollama_url,
         &s.local_model,
-        system,
+        &system,
         &prompt,
         Duration::from_secs(30),
         true,
@@ -1505,6 +1546,50 @@ mod local_tests {
         assert_eq!(chunks.len(), 4);
         assert!(chunks.iter().all(|c| c.chars().count() <= 100 && !c.is_empty()));
         assert_eq!(chunks.concat(), cjk);
+    }
+
+    #[test]
+    fn command_mode_prompt_includes_vocab_and_claude_reinforces_json_without_prefill() {
+        // Empty vocab leaves Command Mode system prompt unchanged.
+        assert_eq!(
+            command_mode_system_prompt(""),
+            crate::command_mode::command_system_prompt()
+        );
+        // Configured vocab (comma, newline, semicolon) is included in Command Mode prompt.
+        let with_vocab = command_mode_system_prompt("Parakeet; Ollama\nlisten-rs, CLAUDE.md");
+        assert!(with_vocab.starts_with(crate::command_mode::command_system_prompt()));
+        assert!(
+            with_vocab.contains("Parakeet, Ollama, listen-rs, CLAUDE.md"),
+            "expected vocab words in command mode prompt, got: {with_vocab}"
+        );
+
+        // claude_request_payload reinforces JSON-only system instruction without assistant `{` prefill.
+        let plain = claude_request_payload("claude-haiku-5-5", "Review draft.", "<draft>hi</draft>", false);
+        assert_eq!(plain["system"], "Review draft.");
+        assert_eq!(plain["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(plain["messages"][0]["role"], "user");
+
+        let json_payload = claude_request_payload("claude-haiku-5-5", "Review draft.", "<draft>hi</draft>", true);
+        let reinforced = json_payload["system"].as_str().unwrap();
+        assert!(reinforced.starts_with("Review draft."));
+        assert!(
+            reinforced.to_ascii_lowercase().contains("json"),
+            "expected JSON-only reinforcement in system prompt, got: {reinforced}"
+        );
+        assert!(reinforced.len() > "Review draft.".len());
+        let messages = json_payload["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "must NOT add assistant '{{' prefill message");
+        assert_eq!(messages[0]["role"], "user");
+
+        // extract_claude_text strips <think>...</think> blocks (including case-insensitive).
+        let with_think = json!({
+            "content": [{"type": "text", "text": "<THINK>reasoning</THINK>\n{\"score\": 8}"}]
+        });
+        assert_eq!(extract_claude_text(&with_think).unwrap(), "{\"score\": 8}");
+        let think_only = json!({
+            "content": [{"type": "text", "text": "<think>nothing else</think>"}]
+        });
+        assert!(extract_claude_text(&think_only).is_err());
     }
 }
 

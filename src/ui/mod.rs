@@ -60,7 +60,7 @@ impl SettingsSection {
             Self::VoiceAi => "voice ai speech engine parakeet whisper download model install ollama formatting style benchmark app tone casual polished technical rules",
             Self::Snippets => "snippets voice triggers expansion templates email signature",
             Self::Appearance => "appearance theme color scheme palette warm charcoal paper midnight sage contrast espresso nordic plum ocean obsidian mist blossom layout desk sidebar compact zoom",
-            Self::PromptLab => "prompt lab target auto coding general writing checking provider claude openai gemini local learned preferences",
+            Self::PromptLab => "prompt lab target auto coding general writing checking provider claude openai gemini local",
             Self::System => "system shortcuts keyboard saved files clear drafts logs diagnostics version",
         }
     }
@@ -189,8 +189,6 @@ pub struct SettingsUiState {
     pub tone_error: Option<String>,
     pub confirm_clear_drafts: bool,
     pub confirm_clear_logs: bool,
-    pub learned_lines: Vec<String>,
-    pub learned_snippet: String,
     pub diagnostics_summary: String,
 }
 
@@ -320,8 +318,6 @@ pub enum UiAction {
     SetJudgeLocalModel(String),
     SetCloudEnabled(bool),
     SetClaudeModel(String),
-    SetLearn(bool),
-    ResetLearned,
     ClearDrafts,
     ClearLogs,
 

@@ -501,34 +501,46 @@ fn app_tones_view(settings: &Settings) -> Value {
     })
 }
 
+pub(crate) fn upsert_app_tone_rule(
+    rules: &mut Vec<crate::app_tone::AppToneRule>,
+    app: &str,
+    tone: crate::app_tone::TonePreset,
+) -> Result<(), String> {
+    let rule = crate::app_tone::validate_rule(app, tone)?;
+    if let Some(existing) = rules
+        .iter_mut()
+        .find(|item| crate::app_tone::same_app_rule(&item.app, &rule.app))
+    {
+        *existing = rule;
+        return Ok(());
+    }
+    if rules.len() >= MAX_APP_TONE_RULES {
+        return Err(format!(
+            "You can save up to {MAX_APP_TONE_RULES} app tone rules."
+        ));
+    }
+    rules.push(rule);
+    Ok(())
+}
+
 fn add_app_tone(core: &Core, args: &[Value]) -> Value {
     let app = args.first().and_then(Value::as_str).unwrap_or("");
     let tone_id = args.get(1).and_then(Value::as_str).unwrap_or("");
     let Some(tone) = crate::app_tone::TonePreset::from_id(tone_id) else {
         return json!({ "ok": false, "message": "Choose a valid tone preset." });
     };
-    let rule = match crate::app_tone::validate_rule(app, tone) {
-        Ok(r) => r,
-        Err(msg) => return json!({ "ok": false, "message": msg }),
-    };
-    let mut overflow = false;
+    let mut err_msg: Option<String> = None;
     let saved = update(core, |s| {
-        if let Some(existing) = s
-            .app_tone_rules
-            .iter_mut()
-            .find(|item| item.app.eq_ignore_ascii_case(&rule.app))
-        {
-            *existing = rule.clone();
-        } else if s.app_tone_rules.len() >= MAX_APP_TONE_RULES {
-            overflow = true;
-            return false;
-        } else {
-            s.app_tone_rules.push(rule.clone());
+        match upsert_app_tone_rule(&mut s.app_tone_rules, app, tone) {
+            Ok(()) => true,
+            Err(msg) => {
+                err_msg = Some(msg);
+                false
+            }
         }
-        true
     });
-    if overflow {
-        return json!({ "ok": false, "message": format!("You can save up to {MAX_APP_TONE_RULES} app tone rules.") });
+    if let Some(msg) = err_msg {
+        return json!({ "ok": false, "message": msg });
     }
     if !saved {
         return json!({ "ok": false, "message": "Could not save app tone rule." });
@@ -544,7 +556,8 @@ fn delete_app_tone(core: &Core, args: &[Value]) -> Value {
     }
     let saved = update(core, |s| {
         let before = s.app_tone_rules.len();
-        s.app_tone_rules.retain(|item| !item.app.eq_ignore_ascii_case(app));
+        s.app_tone_rules
+            .retain(|item| !crate::app_tone::same_app_rule(&item.app, app));
         s.app_tone_rules.len() != before
     });
     if !saved {
@@ -1095,5 +1108,74 @@ mod tests {
             call(&core, "resummarize_meeting", &[json!(1)]).unwrap()["ok"],
             false
         );
+    }
+
+    #[test]
+    fn app_tone_rule_dedup_validation_and_max_cap() {
+        let mut initial = vec![crate::app_tone::AppToneRule {
+            app: "Discord".into(),
+            tone: crate::app_tone::TonePreset::Casual,
+        }];
+        for i in 1..MAX_APP_TONE_RULES {
+            initial.push(crate::app_tone::AppToneRule {
+                app: format!("App{i}"),
+                tone: crate::app_tone::TonePreset::Default,
+            });
+        }
+        assert_eq!(initial.len(), MAX_APP_TONE_RULES);
+
+        let (core, _) = Core::new(
+            Settings {
+                app_tone_rules: initial,
+                ..Default::default()
+            },
+            true,
+        );
+
+        // ".exe" alone is rejected by validate_rule.
+        assert_eq!(
+            call(&core, "add_app_tone", &[json!(".exe"), json!("casual")]).unwrap()["ok"],
+            false
+        );
+        assert_eq!(
+            call(&core, "add_app_tone", &[json!("  .EXE "), json!("polished")]).unwrap()["ok"],
+            false
+        );
+
+        // At MAX_APP_TONE_RULES (100), updating "Discord" via "Discord.exe" deduplicates in place.
+        let upd = call(&core, "add_app_tone", &[json!("Discord.exe"), json!("technical")]).unwrap();
+        assert_eq!(upd["ok"], true, "updating existing rule at cap via .exe variant must succeed");
+        assert_eq!(upd["rules"].as_array().unwrap().len(), MAX_APP_TONE_RULES);
+        assert_eq!(upd["rules"][0]["app"], "Discord.exe");
+        assert_eq!(upd["rules"][0]["tone"], "technical");
+
+        // Adding a 101st distinct rule is rejected with cap message.
+        let overflow = call(&core, "add_app_tone", &[json!("Notion"), json!("polished")]).unwrap();
+        assert_eq!(overflow["ok"], false);
+        assert!(
+            overflow["message"].as_str().unwrap_or("").contains("100"),
+            "expected cap error mentioning 100, got: {overflow}"
+        );
+        assert_eq!(core.settings.lock().unwrap().app_tone_rules.len(), MAX_APP_TONE_RULES);
+
+        // Deleting by non-.exe variant removes the "Discord.exe" rule via same_app_rule.
+        let del = call(&core, "delete_app_tone", &[json!("discord")]).unwrap();
+        assert_eq!(del["ok"], true);
+        assert_eq!(del["rules"].as_array().unwrap().len(), MAX_APP_TONE_RULES - 1);
+
+        // Direct upsert_app_tone_rule helper parity (the exact function called by app.rs).
+        let mut direct: Vec<crate::app_tone::AppToneRule> = (0..MAX_APP_TONE_RULES)
+            .map(|i| crate::app_tone::AppToneRule {
+                app: if i == 0 { "Discord".into() } else { format!("Rule{i}") },
+                tone: crate::app_tone::TonePreset::Default,
+            })
+            .collect();
+        assert!(upsert_app_tone_rule(&mut direct, ".exe", crate::app_tone::TonePreset::Casual).is_err());
+        assert!(upsert_app_tone_rule(&mut direct, "Discord.exe", crate::app_tone::TonePreset::Polished).is_ok());
+        assert_eq!(direct.len(), MAX_APP_TONE_RULES);
+        assert_eq!(direct[0].app, "Discord.exe");
+        assert_eq!(direct[0].tone, crate::app_tone::TonePreset::Polished);
+        assert!(upsert_app_tone_rule(&mut direct, "NewApp101", crate::app_tone::TonePreset::Technical).is_err());
+        assert_eq!(direct.len(), MAX_APP_TONE_RULES);
     }
 }

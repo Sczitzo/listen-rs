@@ -108,6 +108,7 @@ impl ActiveDelivery {
 struct PendingRecovery {
     saved: Snapshot,
     delivery_seq: u32,
+    require_owner: bool,
 }
 
 struct OwnerState {
@@ -599,12 +600,20 @@ fn active_sequence() -> u32 {
     ACTIVE.lock().unwrap().as_ref().map_or(0, |d| d.sequence)
 }
 
-fn record_pending(saved: Option<Snapshot>, delivery_seq: u32) {
+fn record_pending_with_owner(saved: Option<Snapshot>, delivery_seq: u32, require_owner: bool) {
     if let Some(snap) = saved {
         if !snap.is_empty() {
-            *PENDING.lock().unwrap() = Some(PendingRecovery { saved: snap, delivery_seq });
+            *PENDING.lock().unwrap() = Some(PendingRecovery {
+                saved: snap,
+                delivery_seq,
+                require_owner,
+            });
         }
     }
+}
+
+fn record_pending(saved: Option<Snapshot>, delivery_seq: u32) {
+    record_pending_with_owner(saved, delivery_seq, true);
 }
 
 fn rollback_open_clipboard(owner: HWND, saved: Option<Snapshot>) {
@@ -904,31 +913,70 @@ pub(crate) fn snapshot_for_command(
     }
 }
 
-/// Restore the user's clipboard immediately after Command Mode reads the copied selection,
-/// only if no paste recovery is pending and the clipboard sequence still matches `post_copy_seq`.
-pub(crate) fn restore_after_command(
+fn restore_after_command_with<A, G, W, S>(
     snapshot: Option<CommandClipboardSnapshot>,
     post_copy_seq: Option<u32>,
-) {
+    acquire: A,
+    write_snapshot: W,
+    current_seq: S,
+) -> Result<(), String>
+where
+    A: FnOnce() -> Result<G, &'static str>,
+    W: FnOnce(&[(u32, Vec<u8>)]) -> Result<(), &'static str>,
+    S: Fn() -> u32,
+{
     let Some(snapshot) = snapshot else {
-        return;
+        return Ok(());
     };
     let _tx_guard = TRANSACTION_LOCK.lock().unwrap();
     if PENDING.lock().unwrap().is_some() {
-        return;
+        return Err("Previous clipboard recovery is already pending.".into());
     }
-    let Some(owner) = ensure_owner() else {
-        return;
-    };
-    let Some(_clip) = OpenClip::acquire(owner) else {
-        return;
+    let _clip = match acquire() {
+        Ok(guard) => guard,
+        Err(reason) => {
+            let seq = post_copy_seq.unwrap_or_else(&current_seq);
+            record_pending_with_owner(Some(snapshot.saved), seq, false);
+            return Err(format!(
+                "Could not restore previous clipboard ({reason}). Resolve clipboard recovery in Listen."
+            ));
+        }
     };
     if let Some(expected) = post_copy_seq {
-        if unsafe { GetClipboardSequenceNumber() } != expected {
-            return;
+        if current_seq() != expected {
+            return Ok(());
         }
     }
-    let _ = write_snapshot_open_clipboard(&snapshot.saved);
+    match write_snapshot(&snapshot.saved) {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            let seq = current_seq();
+            record_pending_with_owner(Some(snapshot.saved), seq, false);
+            Err(format!(
+                "Could not restore previous clipboard ({reason}). Resolve clipboard recovery in Listen."
+            ))
+        }
+    }
+}
+
+/// Restore the user's clipboard immediately after Command Mode reads the copied selection,
+/// only if no paste recovery is pending and the clipboard sequence still matches `post_copy_seq`.
+/// If locking or writing the clipboard fails, persists the snapshot into `PENDING` recovery
+/// so user clipboard data is never silently dropped.
+pub(crate) fn restore_after_command(
+    snapshot: Option<CommandClipboardSnapshot>,
+    post_copy_seq: Option<u32>,
+) -> Result<(), String> {
+    restore_after_command_with(
+        snapshot,
+        post_copy_seq,
+        || {
+            let owner = ensure_owner().ok_or("Windows clipboard helper is unavailable")?;
+            OpenClip::acquire(owner).ok_or("Clipboard is busy")
+        },
+        write_snapshot_open_clipboard,
+        || unsafe { GetClipboardSequenceNumber() },
+    )
 }
 
 pub(crate) fn restore_pending(confirmed: bool) -> serde_json::Value {
@@ -964,7 +1012,7 @@ pub(crate) fn restore_pending(confirmed: bool) -> serde_json::Value {
         });
     };
     let current = unsafe { GetClipboardSequenceNumber() };
-    let owned_by_us = unsafe { GetClipboardOwner() } == owner;
+    let owned_by_us = !item.require_owner || unsafe { GetClipboardOwner() } == owner;
     let active_seq = active_sequence();
     let seq_matches = current == item.delivery_seq || (active_seq != 0 && current == active_seq);
     if !owned_by_us || !seq_matches {
@@ -1106,5 +1154,77 @@ mod tests {
         assert!(!is_safe_standard_format(CF_BITMAP));
         assert!(!is_safe_standard_format(3)); // CF_METAFILEPICT
         assert!(!is_safe_standard_format(14)); // CF_ENHMETAFILE
+    }
+
+    #[test]
+    fn restore_after_command_preserves_snapshot_in_pending_on_acquire_or_write_failure() {
+        struct PendingReset;
+        impl Drop for PendingReset {
+            fn drop(&mut self) {
+                *PENDING.lock().unwrap() = None;
+            }
+        }
+        let _reset = PendingReset;
+        *PENDING.lock().unwrap() = None;
+
+        let saved: Snapshot = vec![(CF_UNICODETEXT, vec![b'H', 0, b'i', 0, 0, 0])];
+
+        // 1. OpenClip::acquire failure persists snapshot in PENDING and returns Err.
+        let acquire_err = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved: saved.clone() }),
+            Some(42),
+            || Err::<(), &'static str>("Clipboard is busy"),
+            |_| panic!("write_snapshot must not run when acquire fails"),
+            || 42,
+        );
+        assert!(acquire_err.is_err());
+        {
+            let guard = PENDING.lock().unwrap();
+            let pending = guard.as_ref().expect("snapshot must be saved in PENDING on acquire failure");
+            assert_eq!(pending.saved, saved);
+            assert_eq!(pending.delivery_seq, 42);
+            assert!(!pending.require_owner);
+        }
+        *PENDING.lock().unwrap() = None;
+
+        // 2. write_snapshot failure persists snapshot in PENDING with post-failure seq and returns Err.
+        let write_err = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved: saved.clone() }),
+            Some(42),
+            || Ok(()),
+            |_| Err("Cannot restore clipboard format."),
+            || 42,
+        );
+        assert!(write_err.is_err());
+        {
+            let guard = PENDING.lock().unwrap();
+            let pending = guard.as_ref().expect("snapshot must be saved in PENDING on write failure");
+            assert_eq!(pending.saved, saved);
+            assert_eq!(pending.delivery_seq, 42);
+            assert!(!pending.require_owner);
+        }
+        *PENDING.lock().unwrap() = None;
+
+        // 3. When a newer clipboard item replaced the clipboard, skip write and keep PENDING clear.
+        let superseded = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved: saved.clone() }),
+            Some(42),
+            || Ok(()),
+            |_| panic!("must not clobber newer clipboard item"),
+            || 43,
+        );
+        assert!(superseded.is_ok());
+        assert!(PENDING.lock().unwrap().is_none());
+
+        // 4. Successful restore leaves PENDING clear and returns Ok.
+        let ok = restore_after_command_with(
+            Some(CommandClipboardSnapshot { saved }),
+            Some(42),
+            || Ok(()),
+            |_| Ok(()),
+            || 42,
+        );
+        assert!(ok.is_ok());
+        assert!(PENDING.lock().unwrap().is_none());
     }
 }

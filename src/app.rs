@@ -222,7 +222,14 @@ impl ListenApp {
                 .unwrap_or(0)
         };
 
-        let favorites = if preview { Vec::new() } else { storage::load_favorites() };
+        let workspace = crate::workspace::Workspace::load(&profile);
+        let mut favorites = if preview { Vec::new() } else { storage::load_favorites() };
+        if !preview {
+            let legacy = workspace.legacy_favorites();
+            if crate::workspace::merge_missing_favorites(&mut favorites, &legacy) {
+                storage::save_favorites(&favorites);
+            }
+        }
         let tray = if preview {
             None
         } else {
@@ -306,7 +313,6 @@ impl ListenApp {
 
         let vocab_buf = settings.vocab.clone();
         let layout = settings.layout;
-        let workspace = crate::workspace::Workspace::load(&profile);
 
         let mut app = ListenApp {
             core,
@@ -372,9 +378,6 @@ impl ListenApp {
             hide_test: None,
         };
         app.sync_lab_ui();
-        if !preview {
-            app.refresh_local_models_async();
-        }
         app
     }
 
@@ -391,10 +394,10 @@ impl ListenApp {
         let url = self.settings.ollama_url.clone();
         let current = self.settings.local_model.clone();
         let _ = std::thread::Builder::new().name("ollama-models".into()).spawn(move || {
-            let (_, models_opt, _) = crate::settings_bridge::local_models_response(false, &url, current);
-            if let Some(list) = models_opt {
-                core.emit(UiEvent::Models(list));
-            }
+            let (_, models_opt, available) =
+                crate::settings_bridge::local_models_response(false, &url, current);
+            core.ollama_available.store(available, Ordering::Relaxed);
+            core.emit(UiEvent::Models(models_opt.unwrap_or_default()));
         });
     }
 
@@ -947,21 +950,19 @@ impl ListenApp {
                 }
                 UiAction::LabPasteDraft => self.paste_draft(ctx),
                 UiAction::LabSaveFavorite(name) => {
-                    let text = self.lab_ui.draft.trim().to_owned();
-                    let label = if name.trim().is_empty() {
-                        text.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
-                    } else {
-                        name.trim().to_owned()
-                    };
-                    if !text.is_empty() && !label.is_empty() {
-                        let (when, _) = storage::now_stamp();
-                        self.favorites.insert(0, Favorite { name: label, text, when, uses: 0 });
-                        if !self.preview() {
-                            storage::save_favorites(&self.favorites);
+                    let (when, _) = storage::now_stamp();
+                    match upsert_favorite(&mut self.favorites, &name, &self.lab_ui.draft, when) {
+                        Some(updated) => {
+                            if !self.preview() {
+                                storage::save_favorites(&self.favorites);
+                            }
+                            self.lab_ui.save_fav_open = false;
+                            self.lab_ui.save_fav_name.clear();
+                            self.toast(if updated { "Updated favorite" } else { "Saved favorite" });
                         }
-                        self.lab_ui.save_fav_open = false;
-                        self.lab_ui.save_fav_name.clear();
-                        self.toast("Saved favorite");
+                        None => {
+                            self.toast("The draft is empty");
+                        }
                     }
                 }
                 UiAction::LabLoadFavorite(idx) => {
@@ -971,9 +972,22 @@ impl ListenApp {
                         if !self.preview() {
                             storage::save_favorites(&self.favorites);
                         }
+                        if !self.lab_ui.draft.trim().is_empty()
+                            || self.lab_ui.candidate.is_some()
+                            || !self.lab_ui.instruction.trim().is_empty()
+                        {
+                            let _ = self.workspace.call("new_draft", &[]);
+                        }
                         self.draft_change_stamp = self.draft_change_stamp.wrapping_add(1);
                         self.lab_ui.draft = text.clone();
+                        self.lab_ui.instruction.clear();
+                        self.lab_ui.candidate = None;
+                        self.lab_ui.compare_open = false;
                         self.save_lab_text(&text);
+                        self.sync_lab_ui();
+                        if self.workspace.is_read_only() {
+                            self.lab_ui.draft = text;
+                        }
                         self.lab_ui.show_library = false;
                         self.toast("Loaded favorite");
                     }
@@ -1155,24 +1169,20 @@ impl ListenApp {
                     self.toast("Benchmark canceled");
                 }
                 UiAction::SetAutoAppTone(v) => self.settings.auto_app_tone = v,
-                UiAction::AddAppToneRule { app, tone } => match crate::app_tone::validate_rule(&app, tone) {
-                    Ok(rule) => {
-                        if let Some(existing) = self
-                            .settings
-                            .app_tone_rules
-                            .iter_mut()
-                            .find(|r| r.app.eq_ignore_ascii_case(&rule.app))
-                        {
-                            *existing = rule;
-                        } else {
-                            self.settings.app_tone_rules.push(rule);
+                UiAction::AddAppToneRule { app, tone } => {
+                    match crate::settings_bridge::upsert_app_tone_rule(
+                        &mut self.settings.app_tone_rules,
+                        &app,
+                        tone,
+                    ) {
+                        Ok(()) => {
+                            self.settings_ui.tone_app_input.clear();
+                            self.settings_ui.tone_error = None;
+                            self.toast("Saved app tone rule");
                         }
-                        self.settings_ui.tone_app_input.clear();
-                        self.settings_ui.tone_error = None;
-                        self.toast("Saved app tone rule");
+                        Err(e) => self.settings_ui.tone_error = Some(e),
                     }
-                    Err(e) => self.settings_ui.tone_error = Some(e),
-                },
+                }
                 UiAction::DeleteAppToneRule(idx) => {
                     if idx < self.settings.app_tone_rules.len() {
                         self.settings.app_tone_rules.remove(idx);
@@ -1208,8 +1218,6 @@ impl ListenApp {
                 UiAction::SetJudgeLocalModel(m) => self.settings.judge_local_model = m,
                 UiAction::SetCloudEnabled(v) => self.settings.cloud_enabled = v,
                 UiAction::SetClaudeModel(m) => self.settings.claude_model = m,
-                UiAction::SetLearn(v) => self.settings.learn = v,
-                UiAction::ResetLearned => self.toast("Learned preferences cleared"),
                 UiAction::ClearDrafts => {
                     let res = self.workspace.call("clear_private_data", &[json!("workspace"), json!("DELETE")]);
                     self.draft_change_stamp = self.draft_change_stamp.wrapping_add(1);
@@ -1378,7 +1386,7 @@ impl ListenApp {
                     self.sync_lab_ui();
                 }
                 UiEvent::Models(m) => {
-                    self.ollama_available = !m.is_empty();
+                    self.ollama_available = resolve_ollama_available(&self.core, &m);
                     self.models = m;
                 }
             }
@@ -1630,6 +1638,7 @@ impl ListenApp {
             .benchmark_active
             .store(self.benchmarker.is_active(), Ordering::Relaxed);
         self.installer.cancel();
+        storage::flush_history_updates();
         winput::shutdown_clipboard();
         ctx.send_viewport_cmd(ViewportCommand::Close);
         Ok(())
@@ -1826,8 +1835,11 @@ impl ListenApp {
 
         // Toast pill at bottom-right
         if let Some(msg) = toast_str {
+            let max_w = (ctx.screen_rect().width() - 36.0).clamp(180.0, 420.0);
             egui::Area::new(egui::Id::new("listen-toast"))
+                .order(egui::Order::Foreground)
                 .anchor(Align2::RIGHT_BOTTOM, vec2(-18.0, -16.0))
+                .constrain(true)
                 .show(ctx, |ui| {
                     Frame::default()
                         .fill(p.surface2)
@@ -1835,7 +1847,20 @@ impl ListenApp {
                         .corner_radius(CornerRadius::same(10))
                         .inner_margin(Margin::symmetric(14, 9))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(msg).size(13.0).color(p.fg));
+                            let text_w = ui.fonts(|f| {
+                                f.layout_no_wrap(
+                                    msg.to_owned(),
+                                    FontId::proportional(13.0),
+                                    p.fg,
+                                )
+                                .size()
+                                .x
+                            });
+                            let box_w = (text_w + 2.0).min(max_w - 28.0);
+                            ui.set_width(box_w);
+                            ui.add(
+                                egui::Label::new(RichText::new(msg).size(13.0).color(p.fg)).wrap(),
+                            );
                         });
                 });
         }
@@ -2274,17 +2299,58 @@ fn sync_meeting_ui_from_core(
     }
 }
 
+fn upsert_favorite(
+    favorites: &mut Vec<Favorite>,
+    name: &str,
+    draft: &str,
+    when: String,
+) -> Option<bool> {
+    let text = draft.trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let label = if name.trim().is_empty() {
+        text.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
+    } else {
+        name.trim().to_owned()
+    };
+    if label.is_empty() {
+        return None;
+    }
+    let norm = label.trim().to_ascii_lowercase();
+    if let Some(existing) = favorites
+        .iter_mut()
+        .find(|f| f.name.trim().to_ascii_lowercase() == norm)
+    {
+        existing.name = label;
+        existing.text = text;
+        existing.when = when;
+        Some(true)
+    } else {
+        favorites.insert(0, Favorite { name: label, text, when, uses: 0 });
+        Some(false)
+    }
+}
+
+fn resolve_ollama_available(core: &Core, models: &[String]) -> bool {
+    core.ollama_available.load(Ordering::Relaxed) || !models.is_empty()
+}
+
 fn should_hide_on_close(has_tray: bool, preview: bool) -> bool {
     has_tray && !preview
 }
 
 #[cfg(test)]
 mod close_policy_tests {
-    use super::{parse_assessment_view, should_hide_on_close, sync_meeting_ui_from_core};
+    use super::{
+        parse_assessment_view, resolve_ollama_available, should_hide_on_close,
+        sync_meeting_ui_from_core, upsert_favorite,
+    };
     use crate::engine::Core;
-    use crate::storage::Settings;
-    use crate::ui::MeetingUiState;
+    use crate::storage::{Favorite, Settings};
+    use crate::ui::{MeetingUiState, SettingsSection};
     use serde_json::json;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn window_close_hides_to_tray_by_default_unless_preview_or_no_tray() {
@@ -2355,5 +2421,55 @@ mod close_policy_tests {
         assert!(!ui.summarizing);
         assert!(!core.meeting_active());
         assert_eq!(ui.status_text, "Summarization canceled.");
+    }
+
+    #[test]
+    fn upsert_favorite_deduplicates_normalized_name_and_rejects_empty_draft() {
+        let mut favs = vec![Favorite {
+            name: "Daily Standup".into(),
+            text: "Old template".into(),
+            when: "2026-11-24 09:00".into(),
+            uses: 7,
+        }];
+        assert_eq!(upsert_favorite(&mut favs, "New", "   ", "2026-11-25 10:00".into()), None);
+        assert_eq!(favs.len(), 1);
+
+        // Updating with different casing / surrounding spaces updates in place and keeps `uses`.
+        assert_eq!(
+            upsert_favorite(
+                &mut favs,
+                "  daily standup  ",
+                "Updated standup template",
+                "2026-11-25 10:05".into()
+            ),
+            Some(true)
+        );
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0].name, "daily standup");
+        assert_eq!(favs[0].text, "Updated standup template");
+        assert_eq!(favs[0].uses, 7);
+
+        // Distinct name inserts at front with uses = 0.
+        assert_eq!(
+            upsert_favorite(&mut favs, "Bug Triage", "Repro steps", "2026-11-25 10:10".into()),
+            Some(false)
+        );
+        assert_eq!(favs.len(), 2);
+        assert_eq!(favs[0].name, "Bug Triage");
+    }
+
+    #[test]
+    fn resolve_ollama_available_preserves_reachability_with_zero_models() {
+        let (core, _) = Core::new(Settings::default(), true);
+        core.ollama_available.store(false, Ordering::Relaxed);
+        assert!(!resolve_ollama_available(&core, &[]));
+        assert!(resolve_ollama_available(&core, &["qwen3.5:2b".into()]));
+
+        // Reachable Ollama with 0 installed models must remain available=true.
+        core.ollama_available.store(true, Ordering::Relaxed);
+        assert!(resolve_ollama_available(&core, &[]));
+
+        // Dead learned preferences keyword removed from Prompt Lab settings section.
+        assert!(!SettingsSection::PromptLab.keywords().contains("learned"));
     }
 }

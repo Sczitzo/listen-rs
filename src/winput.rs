@@ -176,6 +176,34 @@ impl Target {
         #[cfg(not(windows))]
         { None }
     }
+
+    /// Transiently reads the target window's title into a fixed stack buffer `[u16; 256]`
+    /// strictly for browser web-app tone classification. Never stored on `Target`,
+    /// logged, or included in `history_app()`.
+    pub fn browser_tone_title(self) -> Option<String> {
+        #[cfg(windows)]
+        { imp::browser_tone_title(self) }
+        #[cfg(not(windows))]
+        { None }
+    }
+}
+
+fn resolve_command_hotkey(
+    command_hotkey: Option<Hotkey>,
+    primary_hotkey: Hotkey,
+    registered_hotkey: Option<&str>,
+) -> Option<Hotkey> {
+    if registered_hotkey.is_some_and(|hk| hk.trim().eq_ignore_ascii_case("ctrl+c")) {
+        return None;
+    }
+    command_hotkey.filter(|&ch| {
+        registered_hotkey != Some(crate::settings_bridge::hotkey_id(ch))
+            && (registered_hotkey.is_some() || ch != primary_hotkey)
+    })
+}
+
+fn should_poll_cmd_other_keys(announced: bool, injecting_copy: bool) -> bool {
+    !announced && !injecting_copy
 }
 
 #[cfg(any(windows, test))]
@@ -217,7 +245,10 @@ pub use multiline::check_native as check_multiline;
 
 #[cfg(windows)]
 mod imp {
-    use super::{admit_delivery, binding, usage_check, Assessment, Binding, Delivery, DeliveryError, Hotkey, Target};
+    use super::{
+        admit_delivery, binding, resolve_command_hotkey, should_poll_cmd_other_keys, usage_check,
+        Assessment, Binding, Delivery, DeliveryError, Hotkey, Target,
+    };
     use crate::engine::{Cmd, Core, Phase};
     use super::{exceeds_recording_limit, locks_recording, starts_recording};
     use crate::storage;
@@ -235,10 +266,11 @@ mod imp {
         GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
-        GUITHREADINFO, HHOOK, IsChild, IsIconic, KBDLLHOOKSTRUCT, LLKHF_INJECTED, PeekMessageW, MSG, PM_REMOVE,
-        SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_HOTKEY,
-        WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, GUITHREADINFO, HHOOK, IsChild, IsIconic,
+        KBDLLHOOKSTRUCT, LLKHF_INJECTED, PeekMessageW, MSG, PM_REMOVE, SetWindowsHookExW,
+        UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
     };
 
     const VK_ESCAPE: i32 = 0x1B;
@@ -550,6 +582,33 @@ mod imp {
         super::app_label(&path)
     }
 
+    pub(super) fn browser_tone_title(target: Target) -> Option<String> {
+        if target.window == 0 {
+            return None;
+        }
+        let hwnd = target.window as HWND;
+        let still_owned = || {
+            let mut pid = 0;
+            let thread = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            thread == target.thread && pid == target.pid
+        };
+        if !still_owned() {
+            return None;
+        }
+        let len = unsafe { GetWindowTextLengthW(hwnd) };
+        if len <= 0 {
+            return None;
+        }
+        let mut buf = [0u16; 256];
+        let copied = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if copied <= 0 || !still_owned() {
+            return None;
+        }
+        let title = String::from_utf16_lossy(&buf[..(copied as usize).min(buf.len())]);
+        let trimmed = title.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
     pub(super) fn history_app(target: Target) -> Option<(String, Option<String>)> {
         let path = target_executable(target)?;
         let name = super::app_label(&path)?;
@@ -624,15 +683,13 @@ mod imp {
                     }
                     let (hot, registered, required_modifiers, pad_button, cmd_hot) = {
                         let settings = core.settings.lock().unwrap();
-                        let cmd_hot = settings
-                            .command_hotkey
-                            .filter(|&ch| {
-                                settings.registered_hotkey.as_deref()
-                                    != Some(crate::settings_bridge::hotkey_id(ch))
-                                    && (settings.registered_hotkey.is_some() || ch != settings.hotkey)
-                            })
-                            .map(vk)
-                            .unwrap_or(0);
+                        let cmd_hot = resolve_command_hotkey(
+                            settings.command_hotkey,
+                            settings.hotkey,
+                            settings.registered_hotkey.as_deref(),
+                        )
+                        .map(vk)
+                        .unwrap_or(0);
                         match active {
                             Some(Binding::Registered { modifiers, key }) => {
                                 (key as i32, true, modifiers, None, cmd_hot)
@@ -811,8 +868,14 @@ mod imp {
                                 } else if trigger_up.is_none() {
                                     trigger_up = Some(Instant::now());
                                 }
-                                let shortcut = other_keys(cmd_hot).iter().enumerate()
-                                    .any(|(key, &pressed)| pressed && !before[key] && key != VK_ESCAPE as usize);
+                                let shortcut = should_poll_cmd_other_keys(
+                                    announced,
+                                    crate::command_mode::is_injecting_copy(),
+                                ) && other_keys(cmd_hot).iter().enumerate().any(
+                                    |(key, &pressed)| {
+                                        pressed && !before[key] && key != VK_ESCAPE as usize
+                                    },
+                                );
                                 let held = trigger_up.unwrap_or_else(Instant::now).duration_since(at).as_secs_f32();
                                 if shortcut || down(VK_ESCAPE) {
                                     if announced {
@@ -1064,7 +1127,15 @@ mod imp {
         snapshot: Option<CommandClipboardSnapshot>,
         post_copy_seq: Option<u32>,
     ) {
-        super::clipboard_paste::restore_after_command(snapshot, post_copy_seq);
+        let _ = super::clipboard_paste::restore_after_command(snapshot, post_copy_seq);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn restore_clipboard_after_command_checked(
+        snapshot: Option<CommandClipboardSnapshot>,
+        post_copy_seq: Option<u32>,
+    ) -> Result<(), String> {
+        super::clipboard_paste::restore_after_command(snapshot, post_copy_seq)
     }
 
     pub(crate) fn restore_delivery_clipboard(confirmed: bool) -> serde_json::Value {
@@ -1396,6 +1467,13 @@ mod imp {
         _post_copy_seq: Option<u32>,
     ) {
     }
+    #[allow(dead_code)]
+    pub(crate) fn restore_clipboard_after_command_checked(
+        _snapshot: Option<CommandClipboardSnapshot>,
+        _post_copy_seq: Option<u32>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     pub(crate) fn restore_delivery_clipboard(_confirmed: bool) -> serde_json::Value {
         serde_json::json!({ "status": "retained", "message": "No clipboard recovery is pending." })
     }
@@ -1477,5 +1555,115 @@ mod tests {
         }
         let own = Target { pid: std::process::id(), ..target };
         assert!(admit_delivery(own, Some(own), false).is_err());
+    }
+
+    #[test]
+    fn command_mode_hotkey_guards_ctrl_c_and_other_key_polling() {
+        // Primary registered hotkey "ctrl+c" (any case) disables Command Mode activation.
+        assert_eq!(
+            resolve_command_hotkey(Some(Hotkey::RightShift), Hotkey::RightCtrl, Some("ctrl+c")),
+            None
+        );
+        assert_eq!(
+            resolve_command_hotkey(Some(Hotkey::RightShift), Hotkey::RightCtrl, Some("Ctrl+C")),
+            None
+        );
+        assert_eq!(
+            resolve_command_hotkey(Some(Hotkey::RightShift), Hotkey::RightCtrl, Some("ctrl+shift+f8")),
+            Some(Hotkey::RightShift)
+        );
+        // Same key as primary legacy hotkey is still refused.
+        assert_eq!(
+            resolve_command_hotkey(Some(Hotkey::RightCtrl), Hotkey::RightCtrl, None),
+            None
+        );
+        // Poll other_keys in cmd_st ONLY while !announced && !injecting_copy.
+        assert!(should_poll_cmd_other_keys(false, false));
+        assert!(!should_poll_cmd_other_keys(true, false));
+        assert!(!should_poll_cmd_other_keys(false, true));
+        assert!(!should_poll_cmd_other_keys(true, true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_tone_title_reads_window_title_transiently_and_handles_empty_or_stale() {
+        use windows_sys::w;
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetWindowThreadProcessId, WS_EX_NOACTIVATE, WS_POPUP,
+        };
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { DestroyWindow(self.0) };
+                }
+            }
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("Inbox - Gmail - Google Chrome"),
+                WS_POPUP,
+                -30_000,
+                -30_000,
+                120,
+                40,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let _guard = TestWindow(hwnd);
+        let mut pid = 0;
+        let thread = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        let target = Target {
+            window: hwnd as isize,
+            pid,
+            focus_pid: pid,
+            thread,
+            focus: hwnd as isize,
+        };
+        assert_eq!(
+            target.browser_tone_title().as_deref(),
+            Some("Inbox - Gmail - Google Chrome")
+        );
+
+        // Stale PID (reused HWND) returns None.
+        let stale = Target { pid: pid.wrapping_add(1), ..target };
+        assert_eq!(stale.browser_tone_title(), None);
+
+        // Empty title window returns None.
+        let empty_hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                -30_000,
+                -30_000,
+                120,
+                40,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!empty_hwnd.is_null());
+        let _empty_guard = TestWindow(empty_hwnd);
+        let mut empty_pid = 0;
+        let empty_thread = unsafe { GetWindowThreadProcessId(empty_hwnd, &mut empty_pid) };
+        let empty_target = Target {
+            window: empty_hwnd as isize,
+            pid: empty_pid,
+            focus_pid: empty_pid,
+            thread: empty_thread,
+            focus: empty_hwnd as isize,
+        };
+        assert_eq!(empty_target.browser_tone_title(), None);
     }
 }

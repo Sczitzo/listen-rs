@@ -57,7 +57,12 @@ pub fn history(entries: &[HistoryEntry], all: bool, clipboard_recovery: bool) ->
         };
         let app = (!entry.app_name.is_empty())
             .then(|| json!({ "name": entry.app_name, "icon": entry.app_icon }));
-        json!({ "ts": entry.when.replace(' ', "T"), "kind": "dictate", "text": entry.text(),
+        let kind = if entry.kind.is_empty() {
+            "dictate"
+        } else {
+            entry.kind.as_str()
+        };
+        json!({ "ts": entry.when.replace(' ', "T"), "kind": kind, "text": entry.text(),
             "raw": entry.raw, "secs": entry.seconds, "latency": entry.processing_secs, "cost": 0,
             "delivery_status": delivery, "clipboard_recovery": clipboard_recovery, "app": app })
     }).collect())
@@ -131,8 +136,10 @@ fn stats_at(entries: &[HistoryEntry], unpriced: usize, when: &str, unix: u64) ->
         let week_offset = (now - stamp).saturating_sub(1).max(0) / WEEK;
         if let Some(week) = weekly.get_mut(week_offset as usize) {
             week.count += 1;
-            week.words += entry.text().split_whitespace().count();
-            week.seconds += f64::from(entry.seconds);
+            if entry.kind != "command" {
+                week.words += entry.text().split_whitespace().count();
+                week.seconds += f64::from(entry.seconds);
+            }
             if entry.processing_secs > 0.0 {
                 week.latency_sum += f64::from(entry.processing_secs);
                 week.latency_count += 1;
@@ -258,5 +265,53 @@ mod tests {
             raw: "Sample direct typing".into(), outcome: "text sent".into(), ..Default::default()
         }], true, false);
         assert_eq!(sent[0]["delivery_status"], "sent");
+    }
+
+    #[test]
+    fn command_mode_history_entries_excluded_from_wpm_and_labeled_command() {
+        // Legacy history.jsonl row without `kind` deserializes cleanly as empty `kind`,
+        // emits `"kind": "dictate"`, and counts toward WPM.
+        let legacy: HistoryEntry = serde_json::from_str(
+            r#"{"when":"2026-11-21 11:55","raw":"one two three four five six seven eight nine ten","seconds":40.0,"processing_secs":0.4,"outcome":"paste confirmed"}"#,
+        )
+        .expect("legacy history row without kind should deserialize");
+        assert_eq!(legacy.kind, "");
+
+        let explicit_dictate = HistoryEntry {
+            when: "2026-11-21 11:57".into(),
+            raw: "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".into(),
+            seconds: 20.0,
+            processing_secs: 0.6,
+            outcome: "paste confirmed".into(),
+            kind: "dictate".into(),
+            ..Default::default()
+        };
+
+        // Command Mode entry with large rewritten selection & tiny voice command duration:
+        // must be labeled `"command"` and excluded from words_week / minutes_week / wpm!
+        let command_entry = HistoryEntry {
+            when: "2026-11-21 11:59".into(),
+            raw: "make this formal".into(),
+            cleaned: "word ".repeat(300).trim().to_owned(),
+            seconds: 2.0,
+            processing_secs: 1.0,
+            outcome: "paste confirmed".into(),
+            kind: "command".into(),
+            ..Default::default()
+        };
+
+        let entries = [legacy, explicit_dictate, command_entry];
+        let rows = history(&entries, true, false);
+        assert_eq!(rows[0]["kind"], "command");
+        assert_eq!(rows[1]["kind"], "dictate");
+        assert_eq!(rows[2]["kind"], "dictate");
+
+        // Total dictation words = 10 + 10 = 20 over 40 + 20 = 60s => 20 WPM.
+        // If command entry were included, words_week would be 320 and WPM would jump to ~310!
+        let s = stats_at(&entries, 0, "2026-11-21 12:00", 0);
+        assert_eq!(s["week"], 3);
+        assert_eq!(s["words_week"], 20);
+        assert_eq!(s["wpm"], 20);
+        assert!((s["minutes_week"].as_f64().unwrap() - 1.0).abs() < 1e-6);
     }
 }

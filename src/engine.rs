@@ -195,6 +195,7 @@ pub struct Core {
     pub capture_paused: std::sync::atomic::AtomicBool,
     pub draft_delivery_pending: AtomicBool,
     pub benchmark_active: AtomicBool,
+    pub ollama_available: AtomicBool,
     #[cfg(windows)]
     pub controller_capture: Mutex<Option<crate::controller::Capture>>,
     tx: Sender<Cmd>,
@@ -262,6 +263,7 @@ impl Core {
             capture_paused: std::sync::atomic::AtomicBool::new(false),
             draft_delivery_pending: AtomicBool::new(false),
             benchmark_active: AtomicBool::new(false),
+            ollama_available: AtomicBool::new(false),
             #[cfg(windows)]
             controller_capture: Mutex::new(None),
             tx,
@@ -920,14 +922,43 @@ fn load_engine(core: &Arc<Core>) {
 struct ActiveCommand {
     selected_text: Option<String>,
     deferred_copy: bool,
+    restore_warning: Option<String>,
 }
 
+const COMMAND_OWN_WINDOW_STATUS: &str =
+    "Switch to another app and highlight text to use Command Mode.";
+const COMMAND_OWN_WINDOW_OUTCOME: &str = "Switch to another app";
+
+struct SelectionCapture {
+    text: Option<String>,
+    restore_warning: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum SelectionCaptureErr {
     ModifiersHeld,
+    ForegroundChanged,
     Other(String),
 }
 
-fn capture_command_selection(restore_clipboard: bool) -> Result<Option<String>, SelectionCaptureErr> {
+#[derive(Debug, PartialEq, Eq)]
+struct CommandAbort {
+    status: String,
+    outcome: &'static str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommandStartPlan {
+    selected_text: Option<String>,
+    deferred_copy: bool,
+    restore_warning: Option<String>,
+}
+
+fn capture_command_selection(
+    expected_hwnd: Option<isize>,
+    allow_modifier_wait: bool,
+    restore_clipboard: bool,
+) -> Result<SelectionCapture, SelectionCaptureErr> {
     if crate::winput::clipboard_recovery_pending() {
         return Err(SelectionCaptureErr::Other(
             "Resolve clipboard recovery in Listen before using Command Mode.".into(),
@@ -937,28 +968,299 @@ fn capture_command_selection(restore_clipboard: bool) -> Result<Option<String>, 
         .map_err(SelectionCaptureErr::Other)?;
     let seq_before = crate::winput::clipboard_sequence();
     #[cfg(windows)]
-    let copy_result = crate::command_mode::copy_selection_with_ctrl_c();
+    let copy_result =
+        crate::command_mode::copy_selection_with_ctrl_c_checked(expected_hwnd, allow_modifier_wait);
     #[cfg(not(windows))]
-    let copy_result: Result<Option<String>, String> = Ok(None);
+    let copy_result: Result<Option<String>, crate::command_mode::CopySelectionError> = {
+        let _ = (expected_hwnd, allow_modifier_wait);
+        Ok(None)
+    };
     let seq_after = crate::winput::clipboard_sequence();
+    let mut restore_warning = None;
     if seq_after != seq_before {
-        crate::winput::restore_clipboard_after_command(snap, seq_after);
+        if let Err(err) = crate::winput::restore_clipboard_after_command_checked(snap, seq_after) {
+            restore_warning = Some(format!(
+                "Warning: couldn't restore your clipboard automatically ({err}). Open Listen to recover it."
+            ));
+        }
     }
     match copy_result {
-        Ok(text) => Ok(text),
-        Err(msg) if msg.contains("Release Shift, Alt, or Win") => {
+        Ok(text) => Ok(SelectionCapture {
+            text,
+            restore_warning,
+        }),
+        Err(crate::command_mode::CopySelectionError::ModifiersHeld) => {
             Err(SelectionCaptureErr::ModifiersHeld)
         }
-        Err(msg) => Err(SelectionCaptureErr::Other(msg)),
+        Err(crate::command_mode::CopySelectionError::ForegroundChanged) => {
+            Err(SelectionCaptureErr::ForegroundChanged)
+        }
+        Err(crate::command_mode::CopySelectionError::Other(msg)) => {
+            let msg = match restore_warning {
+                Some(warn) => format!("{msg} {warn}"),
+                None => msg,
+            };
+            Err(SelectionCaptureErr::Other(msg))
+        }
     }
 }
 
-fn resolve_target_tone(settings: &Settings, target: Option<Target>) -> crate::app_tone::TonePreset {
-    if settings.destination == Destination::Workspace || target.is_some_and(Target::is_ours) {
+fn prepare_command_start<F>(
+    target: Option<Target>,
+    selected_text: Option<String>,
+    hands_free: bool,
+    capture: F,
+) -> Result<CommandStartPlan, CommandAbort>
+where
+    F: FnOnce(Option<isize>, bool) -> Result<SelectionCapture, SelectionCaptureErr>,
+{
+    prepare_command_start_parts(
+        target.map(Target::window),
+        target.is_some_and(Target::is_ours),
+        selected_text,
+        hands_free,
+        capture,
+    )
+}
+
+fn prepare_command_start_parts<F>(
+    target_hwnd: Option<isize>,
+    target_is_ours: bool,
+    selected_text: Option<String>,
+    hands_free: bool,
+    capture: F,
+) -> Result<CommandStartPlan, CommandAbort>
+where
+    F: FnOnce(Option<isize>, bool) -> Result<SelectionCapture, SelectionCaptureErr>,
+{
+    if target_is_ours {
+        return Err(CommandAbort {
+            status: COMMAND_OWN_WINDOW_STATUS.to_owned(),
+            outcome: COMMAND_OWN_WINDOW_OUTCOME,
+        });
+    }
+    if let Some(text) = selected_text {
+        if let Err(err) = crate::command_mode::validate_selected_text(&text) {
+            return Err(CommandAbort {
+                status: err.message().to_owned(),
+                outcome: err.short_outcome(),
+            });
+        }
+        return Ok(CommandStartPlan {
+            selected_text: Some(text),
+            deferred_copy: false,
+            restore_warning: None,
+        });
+    }
+    let Some(hwnd) = target_hwnd else {
+        let err = crate::command_mode::CommandInputError::EmptySelection;
+        return Err(CommandAbort {
+            status: err.message().to_owned(),
+            outcome: err.short_outcome(),
+        });
+    };
+    match capture(Some(hwnd), hands_free) {
+        Ok(SelectionCapture {
+            text: Some(text),
+            restore_warning,
+        }) => {
+            if let Err(err) = crate::command_mode::validate_selected_text(&text) {
+                let status = match restore_warning {
+                    Some(warn) => format!("{} {warn}", err.message()),
+                    None => err.message().to_owned(),
+                };
+                return Err(CommandAbort {
+                    status,
+                    outcome: err.short_outcome(),
+                });
+            }
+            Ok(CommandStartPlan {
+                selected_text: Some(text),
+                deferred_copy: false,
+                restore_warning,
+            })
+        }
+        Ok(SelectionCapture {
+            text: None,
+            restore_warning,
+        }) => {
+            let err = crate::command_mode::CommandInputError::EmptySelection;
+            let status = match restore_warning {
+                Some(warn) => format!("{} {warn}", err.message()),
+                None => err.message().to_owned(),
+            };
+            Err(CommandAbort {
+                status,
+                outcome: err.short_outcome(),
+            })
+        }
+        Err(SelectionCaptureErr::ModifiersHeld) if !hands_free => Ok(CommandStartPlan {
+            selected_text: None,
+            deferred_copy: true,
+            restore_warning: None,
+        }),
+        Err(SelectionCaptureErr::ModifiersHeld) => Err(CommandAbort {
+            status: "Release Shift, Alt, or Win before using Command Mode.".to_owned(),
+            outcome: "Release modifier keys",
+        }),
+        Err(SelectionCaptureErr::ForegroundChanged) => Err(CommandAbort {
+            status: crate::command_mode::CopySelectionError::ForegroundChanged
+                .message()
+                .to_owned(),
+            outcome: "Window changed",
+        }),
+        Err(SelectionCaptureErr::Other(msg)) => Err(CommandAbort {
+            status: msg,
+            outcome: "Command Mode unavailable",
+        }),
+    }
+}
+
+fn resolve_deferred_selection<F, S>(
+    target: Option<Target>,
+    clipboard: &mut Option<u32>,
+    restore_warning: &mut Option<String>,
+    capture: F,
+    refresh_seq: S,
+) -> Result<String, CommandAbort>
+where
+    F: FnOnce(Option<isize>, bool) -> Result<SelectionCapture, SelectionCaptureErr>,
+    S: FnOnce() -> Option<u32>,
+{
+    if target.is_some_and(Target::is_ours) {
+        return Err(CommandAbort {
+            status: COMMAND_OWN_WINDOW_STATUS.to_owned(),
+            outcome: COMMAND_OWN_WINDOW_OUTCOME,
+        });
+    }
+    let Some(expected) = target else {
+        let err = crate::command_mode::CommandInputError::EmptySelection;
+        return Err(CommandAbort {
+            status: err.message().to_owned(),
+            outcome: err.short_outcome(),
+        });
+    };
+    let capture_res = capture(Some(expected.window()), true);
+    // Immediately refresh the clipboard sequence after deferred copy + restore so
+    // fallback paste via `copy_if_clipboard_unchanged` sees the post-restore sequence.
+    *clipboard = refresh_seq();
+    match capture_res {
+        Ok(SelectionCapture {
+            text: Some(text),
+            restore_warning: warn,
+        }) => {
+            if warn.is_some() {
+                *restore_warning = warn;
+            }
+            if let Err(err) = crate::command_mode::validate_selected_text(&text) {
+                let status = match restore_warning.as_deref() {
+                    Some(w) => format!("{} {w}", err.message()),
+                    None => err.message().to_owned(),
+                };
+                return Err(CommandAbort {
+                    status,
+                    outcome: err.short_outcome(),
+                });
+            }
+            Ok(text)
+        }
+        Ok(SelectionCapture {
+            text: None,
+            restore_warning: warn,
+        }) => {
+            if warn.is_some() {
+                *restore_warning = warn;
+            }
+            let err = crate::command_mode::CommandInputError::EmptySelection;
+            let status = match restore_warning.as_deref() {
+                Some(w) => format!("{} {w}", err.message()),
+                None => err.message().to_owned(),
+            };
+            Err(CommandAbort {
+                status,
+                outcome: err.short_outcome(),
+            })
+        }
+        Err(SelectionCaptureErr::ModifiersHeld) => Err(CommandAbort {
+            status: "Release Shift, Alt, or Win before using Command Mode.".to_owned(),
+            outcome: "Release modifier keys",
+        }),
+        Err(SelectionCaptureErr::ForegroundChanged) => Err(CommandAbort {
+            status: crate::command_mode::CopySelectionError::ForegroundChanged
+                .message()
+                .to_owned(),
+            outcome: "Window changed",
+        }),
+        Err(SelectionCaptureErr::Other(msg)) => Err(CommandAbort {
+            status: msg,
+            outcome: "Processing failed",
+        }),
+    }
+}
+
+fn finalize_command_replacement(
+    raw_output: &str,
+    original_selected: &str,
+    voice_command: &str,
+) -> Result<String, String> {
+    let cleaned =
+        crate::command_mode::clean_command_output_for(raw_output, original_selected, voice_command);
+    if cleaned.is_empty() {
+        Err("the model returned nothing".into())
+    } else {
+        Ok(cleaned)
+    }
+}
+
+fn record_ollama_models_probe(core: &Core, result: Result<Vec<String>, String>) -> bool {
+    match result {
+        Ok(models) => {
+            let has_models = !models.is_empty();
+            core.ollama_available.store(true, Ordering::Release);
+            core.emit(UiEvent::Models(models));
+            has_models
+        }
+        Err(_) => {
+            core.ollama_available.store(false, Ordering::Release);
+            core.emit(UiEvent::Models(Vec::new()));
+            false
+        }
+    }
+}
+
+fn resolve_target_tone_with(
+    settings: &Settings,
+    is_ours: bool,
+    app_name: Option<String>,
+    read_browser_title: impl FnOnce() -> Option<String>,
+) -> crate::app_tone::TonePreset {
+    if settings.destination == Destination::Workspace || is_ours {
         return crate::app_tone::TonePreset::Default;
     }
-    let dest_app = target.and_then(Target::app_name).unwrap_or_default();
-    crate::app_tone::resolve_tone(&dest_app, settings.auto_app_tone, &settings.app_tone_rules)
+    let dest_app = app_name.unwrap_or_default();
+    // Privacy invariant: read the window title transiently on the stack ONLY when
+    // auto_app_tone is enabled AND the target app is a known browser.
+    // Never store, log, or pass the title anywhere else.
+    let browser_title = if settings.auto_app_tone && crate::app_tone::is_browser_app(&dest_app) {
+        read_browser_title()
+    } else {
+        None
+    };
+    crate::app_tone::resolve_tone_for_target(
+        &dest_app,
+        browser_title.as_deref(),
+        &settings.app_tone_rules,
+        settings.auto_app_tone,
+    )
+}
+
+fn resolve_target_tone(settings: &Settings, target: Option<Target>) -> crate::app_tone::TonePreset {
+    resolve_target_tone_with(
+        settings,
+        target.is_some_and(Target::is_ours),
+        target.and_then(Target::app_name),
+        || target.and_then(Target::browser_tone_title),
+    )
 }
 
 fn standalone_snippet_expansion(raw: &str, snippets: &[crate::snippets::Snippet]) -> Option<String> {
@@ -1178,11 +1480,9 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
         let s = core.settings();
         let c = core.clone();
         std::thread::spawn(move || {
-            if let Ok(m) = cleanup::ollama_models(&s.ollama_url) {
-                c.emit(UiEvent::Models(m));
-                if s.cleanup {
-                    cleanup::ollama_warm(&s.ollama_url, &s.local_model);
-                }
+            let has_models = record_ollama_models_probe(&c, cleanup::ollama_models(&s.ollama_url));
+            if s.cleanup && has_models {
+                cleanup::ollama_warm(&s.ollama_url, &s.local_model);
             }
         });
     }
@@ -1315,41 +1615,15 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                     }
                 }
                 let s = core.settings();
-                let (captured_selection, deferred_copy) = if let Some(text) = selected_text {
-                    if text.trim().is_empty() {
-                        core.set_status("Highlight text first to use Command Mode.");
-                        core.set_outcome("Highlight text first", 2.5);
+                let plan = match prepare_command_start(target, selected_text, hands_free, |hwnd, wait| {
+                    capture_command_selection(hwnd, wait, s.restore_clipboard)
+                }) {
+                    Ok(plan) => plan,
+                    Err(abort) => {
+                        core.set_status(abort.status);
+                        core.set_outcome(abort.outcome, 2.5);
                         core.cue(Cue::Error);
                         continue;
-                    }
-                    (Some(text), false)
-                } else if target.is_none() || target.is_some_and(Target::is_ours) {
-                    core.set_status("Highlight text first to use Command Mode.");
-                    core.set_outcome("Highlight text first", 2.5);
-                    core.cue(Cue::Error);
-                    continue;
-                } else {
-                    match capture_command_selection(s.restore_clipboard) {
-                        Ok(Some(text)) => (Some(text), false),
-                        Ok(None) => {
-                            core.set_status("Highlight text first to use Command Mode.");
-                            core.set_outcome("Highlight text first", 2.5);
-                            core.cue(Cue::Error);
-                            continue;
-                        }
-                        Err(SelectionCaptureErr::ModifiersHeld) if !hands_free => (None, true),
-                        Err(SelectionCaptureErr::ModifiersHeld) => {
-                            core.set_status("Release Shift, Alt, or Win before using Command Mode.");
-                            core.set_outcome("Release modifier keys", 2.5);
-                            core.cue(Cue::Error);
-                            continue;
-                        }
-                        Err(SelectionCaptureErr::Other(msg)) => {
-                            core.set_status(msg);
-                            core.set_outcome("Command Mode unavailable", 2.5);
-                            core.cue(Cue::Error);
-                            continue;
-                        }
                     }
                 };
 
@@ -1357,9 +1631,14 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                 match recorder.start_with_options(&s.microphone, s.quiet_mode) {
                     Ok(label) => {
                         recording_clipboard = clipboard;
+                        let start_status = match &plan.restore_warning {
+                            Some(warn) => format!("Command Mode — listening on {label}. {warn}"),
+                            None => format!("Command Mode — listening on {label}."),
+                        };
                         active_command = Some(ActiveCommand {
-                            selected_text: captured_selection,
-                            deferred_copy,
+                            selected_text: plan.selected_text,
+                            deferred_copy: plan.deferred_copy,
+                            restore_warning: plan.restore_warning,
                         });
                         let gen = {
                             let mut sh = core.shared.lock().unwrap();
@@ -1383,7 +1662,7 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                             cvar.notify_all();
                         }
                         core.set_phase(Phase::Recording);
-                        core.set_status(format!("Command Mode — listening on {label}."));
+                        core.set_status(start_status);
                         core.cue(Cue::Start);
                         if !core.preview {
                             let (c, tap) = (core.clone(), recorder.tap());
@@ -2064,10 +2343,16 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                     let url = c.settings().ollama_url;
                     match cleanup::ollama_models(&url) {
                         Ok(m) => {
-                            c.set_status(format!("Found {} local model(s).", m.len()));
+                            let count = m.len();
+                            c.ollama_available.store(true, Ordering::Release);
+                            c.set_status(format!("Found {count} local model(s)."));
                             c.emit(UiEvent::Models(m));
                         }
-                        Err(e) => c.set_status(format!("Couldn't list local models: {e}.")),
+                        Err(e) => {
+                            c.ollama_available.store(false, Ordering::Release);
+                            c.set_status(format!("Couldn't list local models: {e}."));
+                            c.emit(UiEvent::Models(Vec::new()));
+                        }
                     }
                 });
             }
@@ -2499,7 +2784,7 @@ fn process_command(
     samples: Vec<f32>,
     held: Duration,
     target: Option<Target>,
-    clipboard: Option<u32>,
+    mut clipboard: Option<u32>,
     cmd_ctx: ActiveCommand,
 ) {
     let gen = core.shared.lock().unwrap().rec_gen;
@@ -2518,26 +2803,27 @@ fn process_command(
         return;
     }
 
+    let mut restore_warning = cmd_ctx.restore_warning;
     let selected = if cmd_ctx.deferred_copy {
         // User held a Shift/Alt Command Mode key while speaking; now that it is released,
         // wait briefly for keys to settle and copy the highlighted text.
         std::thread::sleep(Duration::from_millis(40));
-        match capture_command_selection(s.restore_clipboard) {
-            Ok(Some(text)) => text,
-            Ok(None) => {
-                core.set_status("Highlight text first to use Command Mode.");
-                core.set_outcome("Highlight text first", 2.5);
-                core.cue(Cue::Error);
+        match resolve_deferred_selection(
+            target,
+            &mut clipboard,
+            &mut restore_warning,
+            |hwnd, wait| capture_command_selection(hwnd, wait, s.restore_clipboard),
+            crate::winput::clipboard_sequence,
+        ) {
+            Ok(text) => text,
+            Err(abort) if abort.outcome == "Processing failed" => {
+                recording_failed(core, abort.status);
                 return;
             }
-            Err(SelectionCaptureErr::ModifiersHeld) => {
-                core.set_status("Release Shift, Alt, or Win before using Command Mode.");
-                core.set_outcome("Release modifier keys", 2.5);
+            Err(abort) => {
+                core.set_status(abort.status);
+                core.set_outcome(abort.outcome, 2.5);
                 core.cue(Cue::Error);
-                return;
-            }
-            Err(SelectionCaptureErr::Other(msg)) => {
-                recording_failed(core, msg);
                 return;
             }
         }
@@ -2563,9 +2849,13 @@ fn process_command(
             return;
         }
     };
-    if !crate::command_mode::should_use_command_mode(Some(&selected), &voice_command) {
-        core.set_status("Highlight text first to use Command Mode.");
-        core.set_outcome("Highlight text first", 2.5);
+    if let Err(err) = crate::command_mode::validate_command_inputs(&selected, &voice_command) {
+        let status = match &restore_warning {
+            Some(warn) => format!("{} {warn}", err.message()),
+            None => err.message().to_owned(),
+        };
+        core.set_status(status);
+        core.set_outcome(err.short_outcome(), 2.5);
         core.cue(Cue::Error);
         return;
     }
@@ -2574,7 +2864,9 @@ fn process_command(
     core.shared.lock().unwrap().live_note = "Editing".into();
     core.repaint();
 
-    let replacement = match cleanup::run_command_mode(&s, &selected, &voice_command) {
+    let replacement = match cleanup::run_command_mode(&s, &selected, &voice_command)
+        .and_then(|out| finalize_command_replacement(&out, &selected, &voice_command))
+    {
         Ok(text) => text,
         Err(e) => {
             recording_failed(core, format!("Command Mode failed: {e}."));
@@ -2599,8 +2891,12 @@ fn process_command(
         |text, dest| crate::winput::deliver_dictation(text, dest, allow_ctrl_v, restore_clipboard),
         copy,
     ) {
+        let warn_suffix = match &restore_warning {
+            Some(warn) => format!(" {warn}"),
+            None => String::new(),
+        };
         core.set_status(format!(
-            "Command Mode — {outcome}. {secs:.1} s recognised in {speech_secs:.1} s, total {:.1} s.",
+            "Command Mode — {outcome}. {secs:.1} s recognised in {speech_secs:.1} s, total {:.1} s.{warn_suffix}",
             t0.elapsed().as_secs_f32()
         ));
     }
@@ -2847,12 +3143,45 @@ pub(crate) fn save_and_deliver_using(
 #[allow(clippy::too_many_arguments)]
 fn save_and_deliver_inner(
     core: &Core, raw: String, cleaned: String, secs: f32, processing_secs: f32, target: Option<Target>,
-    force_external_target: bool,
+    is_command: bool,
     deliver: impl FnOnce(&str, Option<Target>) -> Result<crate::winput::Delivery, crate::winput::DeliveryError>,
     copy_fallback: impl FnOnce(&str) -> bool,
 ) -> Option<String> {
+    save_and_deliver_with_store(
+        core,
+        raw,
+        cleaned,
+        secs,
+        processing_secs,
+        target,
+        is_command,
+        deliver,
+        copy_fallback,
+        storage::append_history,
+        |entry, outcome| {
+            // If the final status cannot be saved, the original row still says to check before copying.
+            // Run the post-paste rewrite off the controller thread in live use so Listen returns to Idle
+            // immediately after pasting; `storage` flushes pending updates before any later read/append.
+            if core.preview {
+                let _ = storage::update_latest_history_outcome(entry, outcome);
+            } else {
+                storage::update_latest_history_outcome_async(entry.clone(), outcome.to_owned());
+            }
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_and_deliver_with_store(
+    core: &Core, raw: String, cleaned: String, secs: f32, processing_secs: f32, target: Option<Target>,
+    is_command: bool,
+    deliver: impl FnOnce(&str, Option<Target>) -> Result<crate::winput::Delivery, crate::winput::DeliveryError>,
+    copy_fallback: impl FnOnce(&str) -> bool,
+    append_history: impl FnOnce(&HistoryEntry) -> std::io::Result<()>,
+    update_history_outcome: impl FnOnce(&HistoryEntry, &str),
+) -> Option<String> {
     use crate::winput::Delivery;
-    let to_workspace = !force_external_target
+    let to_workspace = !is_command
         && (core.settings.lock().unwrap().destination == Destination::Workspace
             || target.is_some_and(Target::is_ours));
     let (app_name, app_icon) = if to_workspace { Default::default() }
@@ -2869,10 +3198,10 @@ fn save_and_deliver_inner(
         outcome: if to_workspace { "saved for Prompt Lab" } else { "saved · delivery not confirmed" }.to_string(),
         app_name,
         app_icon,
-        ..Default::default()
+        kind: if is_command { "command".to_owned() } else { String::new() },
     };
     let text = entry.text().to_owned();
-    if let Err(error) = storage::append_history(&entry) {
+    if let Err(error) = append_history(&entry) {
         core.emit(UiEvent::Retained { text, reason: "History could not be saved. Copy your text before closing Listen.".into() });
         core.set_outcome("Open Listen to recover text", 3.0);
         core.set_status(format!("Couldn't save dictation. No text was sent ({:?}).", error.kind()));
@@ -2933,14 +3262,7 @@ fn save_and_deliver_inner(
     };
 
     if matches!(outcome.as_str(), "paste confirmed" | "text sent" | "copied to clipboard" | "kept in Listen") {
-        // If the final status cannot be saved, the original row still says to check before copying.
-        // Run the post-paste rewrite off the controller thread in live use so Listen returns to Idle
-        // immediately after pasting; `storage` flushes pending updates before any later read/append.
-        if core.preview {
-            let _ = storage::update_latest_history_outcome(&entry, &outcome);
-        } else {
-            storage::update_latest_history_outcome_async(entry.clone(), outcome.clone());
-        }
+        update_history_outcome(&entry, &outcome);
     }
     entry.outcome = outcome.clone();
     core.emit(UiEvent::History(entry));
@@ -3798,5 +4120,365 @@ mod tests {
         assert!(core.can_reload_engine());
         core.meeting.lock().unwrap().transcribing = true;
         assert!(!core.can_reload_engine());
+    }
+
+    #[test]
+    fn command_mode_history_entry_sets_kind_command_while_dictation_leaves_default() {
+        let (core, events) = Core::new(
+            Settings {
+                destination: Destination::LastApp,
+                sounds: false,
+                ..Settings::default()
+            },
+            true,
+        );
+        let target = Target::fixture();
+        let mut appended: Vec<HistoryEntry> = Vec::new();
+
+        let cmd_outcome = save_and_deliver_with_store(
+            &core,
+            "make this shorter".into(),
+            "Short version.".into(),
+            1.2,
+            0.4,
+            Some(target),
+            true,
+            |text, dest| {
+                assert_eq!(text, "Short version.");
+                assert_eq!(dest, Some(target));
+                Ok(crate::winput::Delivery::Confirmed)
+            },
+            |_| panic!("confirmed delivery must not copy fallback"),
+            |entry| {
+                appended.push(entry.clone());
+                Ok(())
+            },
+            |_, _| {},
+        );
+        assert_eq!(cmd_outcome.as_deref(), Some("paste confirmed"));
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].kind, "command");
+
+        let emitted_cmd = events
+            .try_iter()
+            .find_map(|ev| match ev {
+                UiEvent::History(entry) => Some(entry),
+                _ => None,
+            })
+            .expect("command mode must emit UiEvent::History");
+        assert_eq!(emitted_cmd.kind, "command");
+        assert_eq!(emitted_cmd.raw, "make this shorter");
+        assert_eq!(emitted_cmd.cleaned, "Short version.");
+
+        // Regular dictation leaves `kind` empty (treated as "dictate").
+        let dict_outcome = save_and_deliver_with_store(
+            &core,
+            "hello world".into(),
+            "Hello world.".into(),
+            1.0,
+            0.2,
+            Some(target),
+            false,
+            |_, _| Ok(crate::winput::Delivery::Sent),
+            |_| panic!("sent delivery must not copy fallback"),
+            |entry| {
+                appended.push(entry.clone());
+                Ok(())
+            },
+            |_, _| {},
+        );
+        assert_eq!(dict_outcome.as_deref(), Some("text sent"));
+        assert_eq!(appended.len(), 2);
+        assert!(appended[1].kind.is_empty());
+    }
+
+    #[test]
+    fn resolve_target_tone_inspects_browser_title_only_for_browsers_when_auto_enabled() {
+        use crate::app_tone::{AppToneRule, TonePreset};
+
+        let auto_on = Settings {
+            destination: Destination::LastApp,
+            auto_app_tone: true,
+            app_tone_rules: Vec::new(),
+            ..Settings::default()
+        };
+
+        // Native apps MUST NOT even invoke the title reader (hard privacy + zero false positives).
+        let vscode_tone = resolve_target_tone_with(
+            &auto_on,
+            false,
+            Some("Code.exe".into()),
+            || panic!("must never read window title for native app Code.exe"),
+        );
+        assert_eq!(vscode_tone, TonePreset::Technical);
+
+        let word_tone = resolve_target_tone_with(
+            &auto_on,
+            false,
+            Some("WINWORD.EXE".into()),
+            || panic!("must never read window title for native app WINWORD.EXE"),
+        );
+        assert_eq!(word_tone, TonePreset::Polished);
+
+        // Known browser with auto_app_tone=true reads transient title and classifies web apps.
+        let mut title_reads = 0usize;
+        let gmail_tone = resolve_target_tone_with(
+            &auto_on,
+            false,
+            Some("chrome.exe".into()),
+            || {
+                title_reads += 1;
+                Some("Inbox (3) - Gmail - Google Chrome".into())
+            },
+        );
+        assert_eq!(title_reads, 1);
+        assert_eq!(gmail_tone, TonePreset::Polished);
+
+        let discord_web = resolve_target_tone_with(
+            &auto_on,
+            false,
+            Some("msedge.exe".into()),
+            || Some("#general - Discord - Microsoft Edge".into()),
+        );
+        assert_eq!(discord_web, TonePreset::Casual);
+
+        let github_web = resolve_target_tone_with(
+            &auto_on,
+            false,
+            Some("firefox.exe".into()),
+            || Some("Pull requests · org/repo · GitHub - Mozilla Firefox".into()),
+        );
+        assert_eq!(github_web, TonePreset::Technical);
+
+        // When auto_app_tone is OFF, browser window title MUST NOT be read.
+        let auto_off = Settings {
+            auto_app_tone: false,
+            ..auto_on.clone()
+        };
+        let off_tone = resolve_target_tone_with(
+            &auto_off,
+            false,
+            Some("chrome.exe".into()),
+            || panic!("must never read window title when auto_app_tone is false"),
+        );
+        assert_eq!(off_tone, TonePreset::Default);
+
+        // Explicit user rule still takes priority over browser web-app detection.
+        let with_rule = Settings {
+            app_tone_rules: vec![AppToneRule {
+                app: "Chrome".into(),
+                tone: TonePreset::Casual,
+            }],
+            ..auto_on.clone()
+        };
+        let ruled_tone = resolve_target_tone_with(
+            &with_rule,
+            false,
+            Some("chrome.exe".into()),
+            || Some("Inbox - Gmail - Google Chrome".into()),
+        );
+        assert_eq!(ruled_tone, TonePreset::Casual);
+
+        // Listen's own window or Workspace destination returns Default without reading title.
+        let own_tone = resolve_target_tone_with(
+            &auto_on,
+            true,
+            Some("chrome.exe".into()),
+            || panic!("must never read window title for Listen's own window"),
+        );
+        assert_eq!(own_tone, TonePreset::Default);
+
+        let ws_settings = Settings {
+            destination: Destination::Workspace,
+            ..auto_on
+        };
+        let ws_tone = resolve_target_tone_with(
+            &ws_settings,
+            false,
+            Some("chrome.exe".into()),
+            || panic!("must never read window title for Workspace destination"),
+        );
+        assert_eq!(ws_tone, TonePreset::Default);
+    }
+
+    #[test]
+    fn start_command_and_validation_distinguish_is_ours_oversized_nul_empty_and_deferred_copy() {
+        let external = Target::fixture();
+
+        // 1. Target::is_ours aborts immediately with distinct own-window message before capture.
+        let own_err = prepare_command_start_parts(Some(external.window()), true, None, false, |_, _| {
+            panic!("is_ours must abort before capturing selection")
+        })
+        .unwrap_err();
+        assert_eq!(
+            own_err.status,
+            "Switch to another app and highlight text to use Command Mode."
+        );
+        assert_eq!(own_err.outcome, "Switch to another app");
+
+        // 2. Oversized pre-selected or synchronously captured selection fails before opening mic.
+        let oversized = "a".repeat(crate::command_mode::MAX_SELECTION_BYTES + 1);
+        let over_err = prepare_command_start(Some(external), Some(oversized.clone()), false, |_, _| {
+            panic!("pre-selected text must not invoke Ctrl+C capture")
+        })
+        .unwrap_err();
+        assert_eq!(
+            over_err.status,
+            crate::command_mode::CommandInputError::OversizedSelection.message()
+        );
+        assert_eq!(over_err.outcome, "Selection too long");
+
+        let sync_over_err = prepare_command_start(Some(external), None, true, |hwnd, wait| {
+            assert_eq!(hwnd, Some(external.window()));
+            assert!(wait, "hands_free=true must allow modifier wait");
+            Ok(SelectionCapture {
+                text: Some(oversized),
+                restore_warning: None,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            sync_over_err.status,
+            crate::command_mode::CommandInputError::OversizedSelection.message()
+        );
+        assert_eq!(sync_over_err.outcome, "Selection too long");
+
+        // 3. NUL byte in selection fails immediately with distinct error.
+        let nul_err = prepare_command_start(Some(external), None, false, |hwnd, wait| {
+            assert_eq!(hwnd, Some(external.window()));
+            assert!(!wait, "hold-to-talk must skip modifier wait");
+            Ok(SelectionCapture {
+                text: Some("bad\0text".into()),
+                restore_warning: None,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            nul_err.status,
+            crate::command_mode::CommandInputError::SelectionHasNul.message()
+        );
+        assert_eq!(nul_err.outcome, "Unsupported selection");
+
+        // 4. Empty selection fails with EmptySelection error.
+        let empty_err = prepare_command_start(Some(external), None, false, |_, _| {
+            Ok(SelectionCapture {
+                text: None,
+                restore_warning: None,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            empty_err.status,
+            crate::command_mode::CommandInputError::EmptySelection.message()
+        );
+        assert_eq!(empty_err.outcome, "Highlight text first");
+
+        // 5. Hold-to-talk with ModifiersHeld enters deferred_copy immediately; hands_free aborts.
+        let deferred = prepare_command_start(Some(external), None, false, |hwnd, wait| {
+            assert_eq!(hwnd, Some(external.window()));
+            assert!(!wait);
+            Err(SelectionCaptureErr::ModifiersHeld)
+        })
+        .expect("hold-to-talk with held modifiers should enter deferred_copy");
+        assert!(deferred.deferred_copy);
+        assert!(deferred.selected_text.is_none());
+
+        let hands_free_mod_err = prepare_command_start(Some(external), None, true, |_, wait| {
+            assert!(wait);
+            Err(SelectionCaptureErr::ModifiersHeld)
+        })
+        .unwrap_err();
+        assert!(hands_free_mod_err.status.contains("Release Shift, Alt, or Win"));
+        assert_eq!(hands_free_mod_err.outcome, "Release modifier keys");
+
+        // 6. ForegroundChanged produces distinct abort message.
+        let fg_err = prepare_command_start(Some(external), None, false, |_, _| {
+            Err(SelectionCaptureErr::ForegroundChanged)
+        })
+        .unwrap_err();
+        assert_eq!(
+            fg_err.status,
+            crate::command_mode::CopySelectionError::ForegroundChanged.message()
+        );
+        assert_eq!(fg_err.outcome, "Window changed");
+
+        // 7. Clipboard restore warning is preserved on successful sync capture.
+        let warned = prepare_command_start(Some(external), None, false, |_, _| {
+            Ok(SelectionCapture {
+                text: Some("hello world".into()),
+                restore_warning: Some("Warning: clipboard recovery pending.".into()),
+            })
+        })
+        .expect("valid selection with restore warning should still proceed");
+        assert_eq!(warned.selected_text.as_deref(), Some("hello world"));
+        assert_eq!(
+            warned.restore_warning.as_deref(),
+            Some("Warning: clipboard recovery pending.")
+        );
+
+        // 8. Empty voice command produces distinct error via validate_command_inputs.
+        let voice_err = crate::command_mode::validate_command_inputs("hello world", "   ")
+            .unwrap_err();
+        assert_eq!(
+            voice_err.message(),
+            "No voice command heard. Speak an edit instruction."
+        );
+        assert_eq!(voice_err.short_outcome(), "No command heard");
+
+        // 9. Deferred copy refreshes clipboard sequence after restore so fallback paste works.
+        let mut seq = Some(10u32);
+        let mut restored_warn = None;
+        let deferred_res = resolve_deferred_selection(
+            Some(external),
+            &mut seq,
+            &mut restored_warn,
+            |hwnd, wait| {
+                assert_eq!(hwnd, Some(external.window()));
+                assert!(wait, "deferred copy must allow modifier wait");
+                Ok(SelectionCapture {
+                    text: Some("selected text".into()),
+                    restore_warning: Some("Clipboard warning.".into()),
+                })
+            },
+            || Some(12u32),
+        );
+        assert_eq!(deferred_res.unwrap(), "selected text");
+        assert_eq!(seq, Some(12u32), "clipboard sequence must refresh after restore");
+        assert_eq!(restored_warn.as_deref(), Some("Clipboard warning."));
+
+        // 10. Clean command output unwraps stray outer fence unless original or voice wants one.
+        assert_eq!(
+            finalize_command_replacement("```\nHello!\n```", "hello", "make it formal").unwrap(),
+            "Hello!"
+        );
+        assert_eq!(
+            finalize_command_replacement(
+                "```rust\nfn main() {}\n```",
+                "fn main() {}",
+                "wrap this in a markdown code block"
+            )
+            .unwrap(),
+            "```rust\nfn main() {}\n```"
+        );
+    }
+
+    #[test]
+    fn ollama_available_tracks_reachability_even_with_zero_models() {
+        let (core, events) = Core::new(Settings::default(), true);
+        assert!(!core.ollama_available.load(Ordering::Acquire));
+
+        record_ollama_models_probe(&core, Ok(Vec::new()));
+        assert!(
+            core.ollama_available.load(Ordering::Acquire),
+            "reachable Ollama with 0 installed models must set ollama_available=true"
+        );
+        assert!(matches!(events.try_recv(), Ok(UiEvent::Models(m)) if m.is_empty()));
+
+        record_ollama_models_probe(&core, Err("connection refused".into()));
+        assert!(
+            !core.ollama_available.load(Ordering::Acquire),
+            "unreachable Ollama must reset ollama_available=false"
+        );
+        assert!(matches!(events.try_recv(), Ok(UiEvent::Models(m)) if m.is_empty()));
     }
 }
