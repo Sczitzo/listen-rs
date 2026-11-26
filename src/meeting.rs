@@ -9,6 +9,8 @@ use std::path::Path;
 
 /// Maximum number of saved meeting notes retained locally in `meetings.json`.
 pub const MAX_MEETINGS: usize = 100;
+/// Filename for incremental crash-recovery meeting transcripts in `data_dir()`.
+const DRAFT_FILENAME: &str = "meeting-draft.json";
 
 /// 160 ms pause window at 16 kHz used to find safe word-boundary chunk cuts.
 const PAUSE_WIN_16K: usize = 2_560;
@@ -28,6 +30,54 @@ pub struct MeetingNote {
     pub transcript: String,
     pub summary: String,
     pub action_items: Vec<String>,
+}
+
+/// Crash-recovery draft persisted incrementally to `meeting-draft.json` in `data_dir()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[allow(dead_code)]
+pub struct MeetingDraft {
+    pub id: u64,
+    pub ts: String,
+    pub loopback_used: bool,
+    pub duration_secs: u64,
+    pub parts: Vec<String>,
+}
+
+/// Atomically save a crash-recovery meeting draft to `%APPDATA%\ListenRs\meeting-draft.json`.
+/// Never touches `meetings.json`.
+#[allow(dead_code)]
+pub fn save_draft(draft: &MeetingDraft) -> std::io::Result<()> {
+    save_draft_at(&storage::data_dir().join(DRAFT_FILENAME), draft)
+}
+
+/// Load a crash-recovery meeting draft from `%APPDATA%\ListenRs\meeting-draft.json`, if present and valid.
+#[allow(dead_code)]
+pub fn load_draft() -> Option<MeetingDraft> {
+    load_draft_at(&storage::data_dir().join(DRAFT_FILENAME))
+}
+
+/// Remove `%APPDATA%\ListenRs\meeting-draft.json` if it exists.
+#[allow(dead_code)]
+pub fn clear_draft() {
+    clear_draft_at(&storage::data_dir().join(DRAFT_FILENAME));
+}
+
+#[allow(dead_code)]
+pub fn save_draft_at(path: &Path, draft: &MeetingDraft) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(draft)?;
+    storage::atomic_write(path, &json)
+}
+
+#[allow(dead_code)]
+pub fn load_draft_at(path: &Path) -> Option<MeetingDraft> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+#[allow(dead_code)]
+pub fn clear_draft_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Load locally saved meeting notes from `%APPDATA%\ListenRs\meetings.json`.
@@ -57,6 +107,50 @@ pub(crate) fn save_meetings_to(path: &Path, notes: &[MeetingNote]) -> std::io::R
     storage::atomic_write(path, &json)
 }
 
+#[inline]
+fn find_quiet_cut_16k(samples: &[f32], start: usize, hard_end: usize, search_back: usize) -> usize {
+    let search_lo = hard_end.saturating_sub(search_back).max(start + 1);
+    if hard_end.saturating_sub(search_lo) >= PAUSE_WIN_16K {
+        let mut best_pos = search_lo;
+        let mut best_energy = f64::MAX;
+        let last_start = hard_end - PAUSE_WIN_16K;
+        let mut pos = search_lo;
+        loop {
+            let win = &samples[pos..pos + PAUSE_WIN_16K];
+            let energy = window_energy(win);
+            if energy < best_energy {
+                best_energy = energy;
+                best_pos = pos;
+            }
+            if pos >= last_start {
+                break;
+            }
+            pos = (pos + PAUSE_STEP_16K).min(last_start);
+        }
+        (best_pos + PAUSE_WIN_16K / 2).clamp(start + 1, hard_end)
+    } else {
+        hard_end
+    }
+}
+
+/// For streaming buffers (such as `meeting-drain`), emit the next quiet-boundary chunk once
+/// `samples` holds at least `max_chunk_secs` seconds of 16 kHz mono audio, returning
+/// `Some((chunk, tail))` where `chunk` and `tail` partition `samples` losslessly with zero
+/// dropped or duplicated samples. Returns `None` while `samples` is shorter than `max_chunk_secs`.
+#[allow(dead_code)]
+pub fn split_next_quiet_chunk_16k(
+    samples: &[f32],
+    max_chunk_secs: usize,
+) -> Option<(&[f32], &[f32])> {
+    let max_samples = max_chunk_secs.max(1).saturating_mul(SAMPLE_RATE);
+    if samples.len() < max_samples {
+        return None;
+    }
+    let search_back = (MAX_SEARCH_BACK_SECS * SAMPLE_RATE).min(max_samples / 3);
+    let cut = find_quiet_cut_16k(samples, 0, max_samples, search_back);
+    Some(samples.split_at(cut))
+}
+
 /// Split 16 kHz mono audio into contiguous chunks of at most `max_chunk_secs` seconds,
 /// cutting at the center of the quietest 160 ms pause near each boundary so words are
 /// not chopped mid-syllable.
@@ -81,29 +175,7 @@ pub fn chunk_audio_16k(samples: &[f32], max_chunk_secs: usize) -> Vec<&[f32]> {
             break;
         }
 
-        let search_lo = hard_end.saturating_sub(search_back).max(start + 1);
-        let cut = if hard_end.saturating_sub(search_lo) >= PAUSE_WIN_16K {
-            let mut best_pos = search_lo;
-            let mut best_energy = f64::MAX;
-            let last_start = hard_end - PAUSE_WIN_16K;
-            let mut pos = search_lo;
-            loop {
-                let win = &samples[pos..pos + PAUSE_WIN_16K];
-                let energy = window_energy(win);
-                if energy < best_energy {
-                    best_energy = energy;
-                    best_pos = pos;
-                }
-                if pos >= last_start {
-                    break;
-                }
-                pos = (pos + PAUSE_STEP_16K).min(last_start);
-            }
-            (best_pos + PAUSE_WIN_16K / 2).clamp(start + 1, hard_end)
-        } else {
-            hard_end
-        };
-
+        let cut = find_quiet_cut_16k(samples, start, hard_end, search_back);
         out.push(&samples[start..cut]);
         start = cut;
     }
@@ -142,6 +214,134 @@ pub fn meeting_summary_system_prompt() -> &'static str {
 /// Build the user prompt wrapping the raw meeting transcript in `<transcript>` tags.
 pub fn build_meeting_summary_prompt(transcript: &str) -> String {
     format!("<transcript>\n{}\n</transcript>", transcript.trim())
+}
+
+/// Split a transcript UTF-8-safely into chunks of at most `max_chars` Unicode characters,
+/// preferring paragraph breaks (`\n\n`), then newlines (`\n`), then sentence boundaries
+/// (`.`, `!`, `?` / CJK sentence punctuation), then whitespace, and finally an exact UTF-8
+/// character boundary so multibyte characters never panic.
+/// Returns an empty `Vec` for empty/whitespace-only input, and a single-element `Vec`
+/// when `transcript.len() <= max_chars` (or its character count is `<= max_chars`).
+#[allow(dead_code)]
+pub fn split_transcript_chunks(transcript: &str, max_chars: usize) -> Vec<String> {
+    let mut rem = transcript.trim();
+    if rem.is_empty() {
+        return Vec::new();
+    }
+    let limit = max_chars.max(1);
+    if rem.len() <= limit {
+        return vec![rem.to_string()];
+    }
+
+    let mut out = Vec::new();
+    while !rem.is_empty() {
+        if rem.len() <= limit {
+            out.push(rem.trim_end().to_string());
+            break;
+        }
+
+        let min_chars = limit / 4;
+        let mut min_byte = 0usize;
+        let mut hard_byte_end = None;
+        for (char_idx, (byte_idx, _)) in rem.char_indices().enumerate() {
+            if char_idx == min_chars {
+                min_byte = byte_idx;
+            }
+            if char_idx == limit {
+                hard_byte_end = Some(byte_idx);
+                break;
+            }
+        }
+
+        let Some(hard_end) = hard_byte_end else {
+            out.push(rem.trim_end().to_string());
+            break;
+        };
+
+        let cut = find_transcript_cut(rem, hard_end, min_byte);
+        let piece = rem[..cut].trim();
+        if !piece.is_empty() {
+            out.push(piece.to_string());
+        }
+        rem = rem[cut..].trim_start();
+    }
+
+    out
+}
+
+fn find_transcript_cut(rem: &str, hard_end: usize, min_byte: usize) -> usize {
+    let window = &rem[..hard_end];
+    let after = &rem[hard_end..];
+
+    // 1. Prefer paragraph boundary (\n\n or \r\n\r\n).
+    if after.starts_with("\n\n") || after.starts_with("\r\n\r\n") {
+        return hard_end;
+    }
+    let para_cut = window
+        .rfind("\n\n")
+        .into_iter()
+        .chain(window.rfind("\r\n\r\n"))
+        .filter(|&pos| pos > 0 && pos >= min_byte)
+        .max();
+    if let Some(pos) = para_cut {
+        return pos;
+    }
+
+    // 2. Prefer single newline (\n).
+    if after.starts_with('\n') || after.starts_with("\r\n") {
+        return hard_end;
+    }
+    if let Some(pos) = window.rfind('\n').filter(|&pos| pos > 0 && pos >= min_byte) {
+        return pos;
+    }
+
+    // 3. Prefer sentence boundary (. ! ? followed by optional closing quote/paren + whitespace,
+    //    or CJK sentence-ending punctuation).
+    if let Some(pos) = find_last_sentence_cut(rem, hard_end, min_byte) {
+        return pos;
+    }
+
+    // 4. Prefer whitespace boundary.
+    if after.chars().next().is_some_and(char::is_whitespace) {
+        return hard_end;
+    }
+    if let Some((pos, _)) = window
+        .char_indices()
+        .rev()
+        .find(|&(idx, ch)| idx > 0 && idx >= min_byte && ch.is_whitespace())
+    {
+        return pos;
+    }
+
+    // 5. Fallback: exact UTF-8 character boundary at `hard_end`.
+    hard_end
+}
+
+fn find_last_sentence_cut(rem: &str, hard_end: usize, min_byte: usize) -> Option<usize> {
+    let window = &rem[..hard_end];
+    let mut best: Option<usize> = None;
+    for (idx, ch) in window.char_indices() {
+        let mut end = idx + ch.len_utf8();
+        let is_boundary = match ch {
+            '。' | '！' | '？' => true,
+            '.' | '!' | '?' => {
+                while let Some(next_ch) = window[end..].chars().next() {
+                    if matches!(next_ch, '"' | '\'' | ')' | ']' | '”' | '’') {
+                        end += next_ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                rem[end..].is_empty()
+                    || rem[end..].chars().next().is_some_and(char::is_whitespace)
+            }
+            _ => false,
+        };
+        if is_boundary && end > 0 && end >= min_byte && end <= hard_end {
+            best = Some(end);
+        }
+    }
+    best
 }
 
 /// Parse a model's JSON response into `(title, summary, action_items)`.
@@ -240,12 +440,7 @@ fn extract_action_items(val: Option<&Value>) -> Vec<String> {
                     let t = s.trim();
                     (!t.is_empty()).then(|| t.to_string())
                 }
-                Value::Object(map) => ["task", "item", "text", "description", "action"]
-                    .iter()
-                    .find_map(|k| map.get(*k).and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
+                Value::Object(map) => format_action_item_object(map),
                 _ => None,
             })
             .collect(),
@@ -259,6 +454,92 @@ fn extract_action_items(val: Option<&Value>) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+fn format_action_item_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    let task = ["task", "item", "text", "description", "action"]
+        .iter()
+        .find_map(|k| map.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    let owner = ["owner", "assignee"]
+        .iter()
+        .find_map(|k| map.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let deadline = ["deadline", "due", "due_date"]
+        .iter()
+        .find_map(|k| map.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut meta = Vec::with_capacity(2);
+    if let Some(owner) = owner {
+        if !contains_case_insensitive_phrase(task, owner) {
+            meta.push(owner.to_string());
+        }
+    }
+    if let Some(deadline) = deadline {
+        let core = strip_deadline_prefix(deadline);
+        if !contains_case_insensitive_phrase(task, deadline)
+            && !contains_case_insensitive_phrase(task, core)
+        {
+            meta.push(format!("due {core}"));
+        }
+    }
+
+    if meta.is_empty() {
+        Some(task.to_string())
+    } else {
+        Some(format!("{task} ({})", meta.join(", ")))
+    }
+}
+
+fn strip_deadline_prefix(deadline: &str) -> &str {
+    let trimmed = deadline.trim();
+    for prefix in ["due by ", "due ", "by "] {
+        if trimmed.len() >= prefix.len()
+            && trimmed.is_char_boundary(prefix.len())
+            && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            let rest = trimmed[prefix.len()..].trim();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    trimmed
+}
+
+fn contains_case_insensitive_phrase(haystack: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return true;
+    }
+    let hay_lower = haystack.to_lowercase();
+    let needle_lower = needle.to_lowercase();
+    let needle_starts_alnum = needle_lower.chars().next().is_some_and(char::is_alphanumeric);
+    let needle_ends_alnum = needle_lower.chars().last().is_some_and(char::is_alphanumeric);
+
+    let mut offset = 0usize;
+    while let Some(rel) = hay_lower[offset..].find(&needle_lower) {
+        let start = offset + rel;
+        let end = start + needle_lower.len();
+        let before_ok = !needle_starts_alnum
+            || start == 0
+            || hay_lower[..start].chars().last().is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = !needle_ends_alnum
+            || end == hay_lower.len()
+            || hay_lower[end..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        let step = hay_lower[start..].chars().next().map_or(1, char::len_utf8);
+        offset = start + step;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -400,5 +681,230 @@ mod tests {
         assert!(parse_meeting_summary("not json at all").is_none());
         assert!(parse_meeting_summary("{}").is_none());
         assert!(parse_meeting_summary(r#"{"title": null, "summary": null, "action_items": null}"#).is_none());
+    }
+
+    #[test]
+    fn split_next_quiet_chunk_carries_tail_losslessly() {
+        assert!(split_next_quiet_chunk_16k(&[], 25).is_none());
+        assert!(split_next_quiet_chunk_16k(&vec![0.2f32; 20 * SAMPLE_RATE], 25).is_none());
+
+        // 65-second stream with uniquely tagged speech samples and two clean 300ms quiet pauses.
+        let total = 65 * SAMPLE_RATE;
+        let mut stream: Vec<f32> = (0..total)
+            .map(|i| 0.25 + ((i % 997) as f32) * 1e-5)
+            .collect();
+        let pause1_start = 22 * SAMPLE_RATE + 4 * SAMPLE_RATE / 10; // 22.4s
+        let pause1_end = pause1_start + 3 * SAMPLE_RATE / 10; // 22.7s
+        stream[pause1_start..pause1_end].fill(0.0);
+
+        let pause2_start = 45 * SAMPLE_RATE + 2 * SAMPLE_RATE / 10; // 45.2s
+        let pause2_end = pause2_start + 3 * SAMPLE_RATE / 10; // 45.5s
+        stream[pause2_start..pause2_end].fill(0.0);
+
+        let mut carry = Vec::new();
+        let mut emitted: Vec<Vec<f32>> = Vec::new();
+        for push in stream.chunks(5 * SAMPLE_RATE) {
+            carry.extend_from_slice(push);
+            while let Some((chunk, tail)) = split_next_quiet_chunk_16k(&carry, 25) {
+                assert!(!chunk.is_empty());
+                assert!(chunk.len() <= 25 * SAMPLE_RATE);
+                assert_eq!(chunk.len() + tail.len(), carry.len());
+                emitted.push(chunk.to_vec());
+                carry = tail.to_vec();
+            }
+        }
+
+        assert!(emitted.len() >= 2, "expected at least 2 streamed chunks, got {}", emitted.len());
+        let cut1 = emitted[0].len();
+        assert!(
+            cut1 >= pause1_start && cut1 <= pause1_end,
+            "expected first cut inside [{pause1_start}, {pause1_end}], got {cut1}"
+        );
+        let cut2 = cut1 + emitted[1].len();
+        assert!(
+            cut2 >= pause2_start && cut2 <= pause2_end,
+            "expected second cut inside [{pause2_start}, {pause2_end}], got {cut2}"
+        );
+
+        // Flush remaining carry through final chunk_audio_16k and verify zero dropped/duplicated samples.
+        let mut reconstructed = Vec::with_capacity(total);
+        for chunk in &emitted {
+            reconstructed.extend_from_slice(chunk);
+        }
+        for tail_chunk in chunk_audio_16k(&carry, 25) {
+            reconstructed.extend_from_slice(tail_chunk);
+        }
+        assert_eq!(reconstructed.len(), stream.len());
+        assert_eq!(reconstructed, stream);
+
+        // Zero max_chunk_secs must clamp cleanly without panicking or infinite-looping.
+        let short_audio = vec![0.1f32; 2 * SAMPLE_RATE];
+        let (c, t) = split_next_quiet_chunk_16k(&short_audio, 0).unwrap();
+        assert!(!c.is_empty() && c.len() <= SAMPLE_RATE);
+        assert_eq!(c.len() + t.len(), short_audio.len());
+    }
+
+    #[test]
+    fn action_item_objects_preserve_owner_and_deadline() {
+        let json = r#"{
+            "title": "Launch Prep",
+            "summary": "Finalized release tasks.",
+            "action_items": [
+                {"task": "Ship v1.2", "owner": "Alice", "deadline": "Friday"},
+                {"action": "Run smoke tests", "assignee": "Bob", "due_date": "2026-12-01"},
+                {"description": "Rotate API key", "due": "tomorrow"},
+                {"item": "Update docs", "owner": "Carol"},
+                {"text": "File report", "owner": "Dan", "deadline": "due Monday"},
+                {"task": "Alice to tag release", "owner": "alice", "deadline": "Friday"},
+                {"task": "Send notes by friday", "owner": "Eve", "deadline": "Friday"},
+                {"task": "Alice to ship v1.2 by Friday", "owner": "Alice", "deadline": "Friday"},
+                {"task": "Review analysis", "owner": "Al"},
+                {"task": "Check logs", "owner": null, "deadline": "   "}
+            ]
+        }"#;
+        let (_, _, items) = parse_meeting_summary(json).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                "Ship v1.2 (Alice, due Friday)",
+                "Run smoke tests (Bob, due 2026-12-01)",
+                "Rotate API key (due tomorrow)",
+                "Update docs (Carol)",
+                "File report (Dan, due Monday)",
+                "Alice to tag release (due Friday)",
+                "Send notes by friday (Eve)",
+                "Alice to ship v1.2 by Friday",
+                "Review analysis (Al)",
+                "Check logs",
+            ]
+        );
+    }
+
+    #[test]
+    fn map_reduce_chunk_splitter_handles_utf8_and_short_fast_path() {
+        assert!(split_transcript_chunks("", 10_000).is_empty());
+        assert!(split_transcript_chunks("   \n\t  ", 10_000).is_empty());
+
+        // Short fast path (<= max_chars and <= 12_000) returns single chunk.
+        let short = "Alice: Quick standup. ".repeat(400); // ~8_800 chars
+        assert!(short.len() <= 12_000);
+        let fast = split_transcript_chunks(&short, 12_000);
+        assert_eq!(fast.len(), 1);
+        assert_eq!(fast[0], short.trim());
+
+        // Prefers paragraph (\n\n) -> newline (\n) -> sentence (. ! ?) -> whitespace.
+        let para_text = "First paragraph has several words here.\n\nSecond paragraph has several words too.";
+        let para_chunks = split_transcript_chunks(para_text, 48);
+        assert_eq!(
+            para_chunks,
+            vec![
+                "First paragraph has several words here.",
+                "Second paragraph has several words too.",
+            ]
+        );
+
+        let line_text = "Line one discusses metrics in detail.\nLine two covers deployment steps.";
+        let line_chunks = split_transcript_chunks(line_text, 44);
+        assert_eq!(
+            line_chunks,
+            vec![
+                "Line one discusses metrics in detail.",
+                "Line two covers deployment steps.",
+            ]
+        );
+
+        // Sentence boundary does not split inside dotted tokens like v1.2.
+        let sent_text = "Check v1.2 now. Then ship it!";
+        let sent_chunks = split_transcript_chunks(sent_text, 20);
+        assert_eq!(sent_chunks, vec!["Check v1.2 now.", "Then ship it!"]);
+
+        // Whitespace fallback when no paragraph, newline, or sentence boundary exists.
+        let ws_text = "alpha beta gamma delta epsilon";
+        let ws_chunks = split_transcript_chunks(ws_text, 16);
+        assert_eq!(ws_chunks, vec!["alpha beta gamma", "delta epsilon"]);
+
+        // Multibyte UTF-8 (emoji, CJK, accented) never panics even with unspaced tokens and small limits.
+        let unspaced_utf8 = "🎉🚀日本語—café".repeat(40);
+        for limit in [1usize, 2, 3, 7, 17, 64] {
+            let chunks = split_transcript_chunks(&unspaced_utf8, limit);
+            assert!(!chunks.is_empty());
+            for c in &chunks {
+                assert!(!c.is_empty());
+                assert!(c.chars().count() <= limit);
+            }
+            assert_eq!(chunks.concat(), unspaced_utf8);
+        }
+
+        // Long ~25_000-char transcript splits cleanly at ~10_000 chars/chunk.
+        let long_transcript = (0..300)
+            .map(|i| format!("Speaker {}: We reviewed milestone {i} and confirmed the rollout plan.", i % 3 + 1))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(long_transcript.chars().count() > 20_000);
+        let long_chunks = split_transcript_chunks(&long_transcript, 10_000);
+        assert!(long_chunks.len() >= 3);
+        for c in &long_chunks {
+            assert!(!c.is_empty());
+            assert!(c.chars().count() <= 10_000);
+        }
+    }
+
+    #[test]
+    fn draft_atomic_roundtrip() {
+        let dir = temp_test_dir("draft");
+        let draft_path = dir.join("meeting-draft.json");
+        let meetings_path = dir.join("meetings.json");
+
+        // Pre-seed meetings.json to prove draft helpers never touch it.
+        let sentinel = br#"[{"id":99,"title":"Existing"}]"#;
+        std::fs::write(&meetings_path, sentinel).unwrap();
+
+        assert!(load_draft_at(&draft_path).is_none());
+
+        let draft1 = MeetingDraft {
+            id: 42,
+            ts: "2026-11-25 16:00".into(),
+            loopback_used: true,
+            duration_secs: 25,
+            parts: vec!["First chunk transcript.".into()],
+        };
+        save_draft_at(&draft_path, &draft1).unwrap();
+        assert_eq!(load_draft_at(&draft_path), Some(draft1.clone()));
+
+        // Incremental overwrite replaces draft atomically without leaving temp files.
+        let draft2 = MeetingDraft {
+            duration_secs: 50,
+            parts: vec![
+                "First chunk transcript.".into(),
+                "Second chunk transcript.".into(),
+            ],
+            ..draft1
+        };
+        save_draft_at(&draft_path, &draft2).unwrap();
+        assert_eq!(load_draft_at(&draft_path), Some(draft2));
+
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+            .collect();
+        assert!(!entries.iter().any(|n| n.ends_with(".tmp")), "leftover tmp files: {entries:?}");
+
+        // meetings.json remained completely untouched.
+        assert_eq!(std::fs::read(&meetings_path).unwrap(), sentinel);
+
+        // Corrupt JSON returns None rather than panicking.
+        std::fs::write(&draft_path, b"{truncated").unwrap();
+        assert!(load_draft_at(&draft_path).is_none());
+
+        // clear_draft_at removes the draft and is idempotent.
+        clear_draft_at(&draft_path);
+        assert!(!draft_path.exists());
+        clear_draft_at(&draft_path);
+
+        // Saving to missing directory surfaces an error.
+        let missing = dir.join("no-such-dir").join("meeting-draft.json");
+        assert!(save_draft_at(&missing, &MeetingDraft::default()).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

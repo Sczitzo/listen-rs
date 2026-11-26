@@ -139,6 +139,7 @@ pub struct ListenApp {
     lab_edit_id: i64,
     lab_composer_edit_id: i64,
     meeting_ui: MeetingUiState,
+    last_meeting_notes_ver: Option<u64>,
     history_ui: HistoryUiState,
     settings_ui: SettingsUiState,
     hotkey_modal: HotkeyModalState,
@@ -329,6 +330,7 @@ impl ListenApp {
             lab_edit_id: 0,
             lab_composer_edit_id: 0,
             meeting_ui,
+            last_meeting_notes_ver: None,
             history_ui: HistoryUiState::default(),
             settings_ui,
             hotkey_modal: HotkeyModalState::default(),
@@ -586,25 +588,11 @@ impl ListenApp {
         if self.preview() {
             return;
         }
-        let snap = self.core.meeting_snapshot();
-        self.meeting_ui.active = snap.get("active").and_then(Value::as_bool).unwrap_or(false);
-        self.meeting_ui.summarizing = snap.get("transcribing").and_then(Value::as_bool).unwrap_or(false);
-        self.meeting_ui.elapsed_secs = snap
-            .get("elapsed_secs")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0) as f32;
-        if let Some(msg) = snap.get("status").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            self.meeting_ui.status_text = msg.to_owned();
-        } else if let Some(warn) = snap.get("loopback_warning").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            self.meeting_ui.status_text = warn.to_owned();
-        } else if !self.meeting_ui.active && !self.meeting_ui.summarizing {
-            self.meeting_ui.status_text.clear();
-        }
-        if let Some(notes_val) = snap.get("notes") {
-            if let Ok(notes) = serde_json::from_value::<Vec<MeetingNote>>(notes_val.clone()) {
-                self.meeting_ui.notes = notes;
-            }
-        }
+        sync_meeting_ui_from_core(
+            &mut self.meeting_ui,
+            &mut self.last_meeting_notes_ver,
+            &self.core,
+        );
     }
 
     fn build_history_stats(&self) -> HistoryStatsView {
@@ -1017,6 +1005,8 @@ impl ListenApp {
                 UiAction::MeetingStart => {
                     if self.preview() {
                         self.toast("Meeting capture disabled in preview mode");
+                    } else if self.benchmarker.is_active() || self.installer.is_active() {
+                        self.toast("Wait for or cancel the active benchmark or model install before starting a meeting.");
                     } else {
                         match self.core.start_meeting_with_loopback(self.meeting_ui.include_system_audio) {
                             Ok(info) => {
@@ -1033,9 +1023,27 @@ impl ListenApp {
                         self.toast(msg);
                     }
                 }
+                UiAction::MeetingResummarize(id) => {
+                    self.core
+                        .benchmark_active
+                        .store(self.benchmarker.is_active(), Ordering::Relaxed);
+                    match self.core.resummarize_meeting(id) {
+                        Ok(()) => {
+                            self.sync_meetings_ui();
+                            self.toast("Re-summarizing meeting…");
+                        }
+                        Err(msg) => self.toast(msg),
+                    }
+                }
                 UiAction::MeetingCancel => {
+                    let was_summarizing = self.meeting_ui.summarizing && !self.meeting_ui.active;
                     self.core.cancel_meeting();
-                    self.toast("Meeting recording canceled");
+                    self.sync_meetings_ui();
+                    if was_summarizing {
+                        self.toast("Canceled");
+                    } else {
+                        self.toast("Meeting recording canceled");
+                    }
                 }
                 UiAction::MeetingDelete(id) => {
                     if let Ok(num) = id.parse::<u64>() {
@@ -1075,9 +1083,13 @@ impl ListenApp {
                 UiAction::SetRestoreClipboard(v) => self.settings.restore_clipboard = v,
                 UiAction::SetQuietMode(v) => self.settings.quiet_mode = v,
                 UiAction::SetSpeechEngine(e) => {
-                    self.settings.speech_engine = e;
-                    self.persist();
-                    self.core.send(Cmd::ReloadEngine);
+                    if self.core.meeting_active() || self.benchmarker.is_active() {
+                        self.toast("Stop the active meeting or benchmark before switching the speech engine.");
+                    } else {
+                        self.settings.speech_engine = e;
+                        self.persist();
+                        self.core.send(Cmd::ReloadEngine);
+                    }
                 }
                 UiAction::SetCleanup(v) => self.settings.cleanup = v,
                 UiAction::SetStyle(s) => self.settings.style = s,
@@ -1087,8 +1099,8 @@ impl ListenApp {
                     self.toast("Refreshing Ollama models…");
                 }
                 UiAction::InstallSpeechModel(id) => {
-                    if self.benchmarker.is_active() {
-                        self.toast("Wait for or cancel the running benchmark first.");
+                    if self.core.meeting_active() || self.benchmarker.is_active() {
+                        self.toast("Stop the active meeting or benchmark before installing a speech model.");
                     } else {
                         let res = self.installer.start("speech", &id, self.settings.ollama_url.clone(), self.preview());
                         if res["ok"].as_bool() != Some(true) {
@@ -1097,16 +1109,20 @@ impl ListenApp {
                     }
                 }
                 UiAction::SelectSpeechModel(id) => {
-                    self.persist();
-                    let ok = crate::settings_bridge::call(&self.core, "set_setting", &[json!("speech_model"), json!(id)])
-                        == Some(json!(true));
-                    if ok {
-                        self.settings = self.core.settings.lock().unwrap().clone();
-                        self.saved = self.settings.clone();
-                        self.vocab_buf = self.settings.vocab.clone();
-                        self.toast("Switched active speech model");
+                    if self.core.meeting_active() || self.benchmarker.is_active() {
+                        self.toast("Stop the active meeting or benchmark before switching speech models.");
                     } else {
-                        self.toast("Could not switch to that speech model.");
+                        self.persist();
+                        let ok = crate::settings_bridge::call(&self.core, "set_setting", &[json!("speech_model"), json!(id)])
+                            == Some(json!(true));
+                        if ok {
+                            self.settings = self.core.settings.lock().unwrap().clone();
+                            self.saved = self.settings.clone();
+                            self.vocab_buf = self.settings.vocab.clone();
+                            self.toast("Switched active speech model");
+                        } else {
+                            self.toast("Could not switch to that speech model.");
+                        }
                     }
                 }
                 UiAction::CancelModelInstall => {
@@ -1114,17 +1130,28 @@ impl ListenApp {
                     self.toast("Install canceled");
                 }
                 UiAction::StartBenchmark => {
-                    if self.core.phase() != Phase::Idle || self.workspace.busy() {
-                        self.toast("Finish active recording or Prompt Lab work first.");
+                    if self.core.phase() != Phase::Idle
+                        || self.workspace.busy()
+                        || self.core.meeting_active()
+                        || self.installer.is_active()
+                    {
+                        self.toast("Finish active dictation, meeting, model install, or Prompt Lab work first.");
                     } else {
                         let res = self.benchmarker.start(self.settings.clone(), "", self.preview());
-                        if res["ok"].as_bool() != Some(true) {
+                        if res["ok"].as_bool() == Some(true) {
+                            self.core
+                                .benchmark_active
+                                .store(self.benchmarker.is_active(), Ordering::Relaxed);
+                        } else {
                             self.toast(res["message"].as_str().unwrap_or("Could not start benchmark"));
                         }
                     }
                 }
                 UiAction::CancelBenchmark => {
                     self.benchmarker.cancel();
+                    self.core
+                        .benchmark_active
+                        .store(self.benchmarker.is_active(), Ordering::Relaxed);
                     self.toast("Benchmark canceled");
                 }
                 UiAction::SetAutoAppTone(v) => self.settings.auto_app_tone = v,
@@ -1599,6 +1626,9 @@ impl ListenApp {
         }
         self.quitting = true;
         self.benchmarker.cancel();
+        self.core
+            .benchmark_active
+            .store(self.benchmarker.is_active(), Ordering::Relaxed);
         self.installer.cancel();
         winput::shutdown_clipboard();
         ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -1904,7 +1934,13 @@ impl ListenApp {
                 PCmd::Finish => self.core.send(Cmd::Finish),
                 PCmd::Cancel => self.core.send(Cmd::Cancel),
                 PCmd::PasteDraft => self.paste_draft(ctx),
-                PCmd::ReloadEngine => self.core.send(Cmd::ReloadEngine),
+                PCmd::ReloadEngine => {
+                    if self.core.meeting_active() || self.benchmarker.is_active() {
+                        self.toast("Stop the active meeting or benchmark before reloading the speech engine.");
+                    } else {
+                        self.core.send(Cmd::ReloadEngine);
+                    }
+                }
             }
         }
     }
@@ -2066,6 +2102,9 @@ impl eframe::App for ListenApp {
             return;
         }
 
+        self.core
+            .benchmark_active
+            .store(self.benchmarker.is_active(), Ordering::Relaxed);
         self.refresh_snap();
         self.drain_events();
         self.sync_meetings_ui();
@@ -2213,13 +2252,38 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+fn sync_meeting_ui_from_core(
+    meeting_ui: &mut MeetingUiState,
+    last_notes_ver: &mut Option<u64>,
+    core: &Core,
+) {
+    let snap = core.meeting_typed_snapshot(*last_notes_ver);
+    meeting_ui.active = snap.active;
+    meeting_ui.summarizing = snap.transcribing;
+    meeting_ui.elapsed_secs = snap.elapsed_secs;
+    if !snap.status.is_empty() {
+        meeting_ui.status_text = snap.status;
+    } else if !snap.loopback_warning.is_empty() {
+        meeting_ui.status_text = snap.loopback_warning;
+    } else if !meeting_ui.active && !meeting_ui.summarizing {
+        meeting_ui.status_text.clear();
+    }
+    if let Some(notes) = snap.notes {
+        meeting_ui.notes = notes;
+        *last_notes_ver = Some(snap.notes_ver);
+    }
+}
+
 fn should_hide_on_close(has_tray: bool, preview: bool) -> bool {
     has_tray && !preview
 }
 
 #[cfg(test)]
 mod close_policy_tests {
-    use super::{parse_assessment_view, should_hide_on_close};
+    use super::{parse_assessment_view, should_hide_on_close, sync_meeting_ui_from_core};
+    use crate::engine::Core;
+    use crate::storage::Settings;
+    use crate::ui::MeetingUiState;
     use serde_json::json;
 
     #[test]
@@ -2249,5 +2313,47 @@ mod close_policy_tests {
         assert_eq!(parsed.by, "qwen3.5:2b");
         assert!(parsed.criteria.iter().any(|(k, v)| k == "clarity" && *v == 9));
         assert!(parsed.criteria.iter().any(|(k, v)| k == "constraints" && *v == 8));
+    }
+
+    #[test]
+    fn sync_meeting_ui_uses_typed_snapshot_and_updates_notes_only_on_version_change() {
+        let (core, _) = Core::new(Settings::default(), true);
+        let mut ui = MeetingUiState::default();
+        let mut last_ver = None;
+
+        // First sync fetches the initial notes and records notes_ver = 0.
+        sync_meeting_ui_from_core(&mut ui, &mut last_ver, &core);
+        assert_eq!(last_ver, Some(0));
+        assert_eq!(ui.notes.len(), 1);
+        let sample_id = ui.notes[0].id;
+
+        // Mutating local ui.notes without changing core.notes_ver proves a second sync
+        // skips re-cloning / overwriting notes when the version matches.
+        ui.notes[0].title = "Sentinel".into();
+        sync_meeting_ui_from_core(&mut ui, &mut last_ver, &core);
+        assert_eq!(last_ver, Some(0));
+        assert_eq!(ui.notes[0].title, "Sentinel");
+
+        // Deleting a note bumps notes_ver and refreshes ui.notes.
+        assert!(core.delete_meeting(sample_id));
+        sync_meeting_ui_from_core(&mut ui, &mut last_ver, &core);
+        assert_eq!(last_ver, Some(1));
+        assert!(ui.notes.is_empty());
+
+        // Canceling during summarization clears summarizing + meeting_active cleanly.
+        {
+            let mut m = core.meeting.lock().unwrap();
+            m.transcribing = true;
+            m.status = "Summarizing…".into();
+        }
+        sync_meeting_ui_from_core(&mut ui, &mut last_ver, &core);
+        assert!(ui.summarizing);
+        assert!(core.meeting_active());
+
+        core.cancel_meeting();
+        sync_meeting_ui_from_core(&mut ui, &mut last_ver, &core);
+        assert!(!ui.summarizing);
+        assert!(!core.meeting_active());
+        assert_eq!(ui.status_text, "Summarization canceled.");
     }
 }

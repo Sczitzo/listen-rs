@@ -106,6 +106,9 @@ pub fn render_meetings(
             if state.summarizing {
                 ui.add(egui::Spinner::new().size(15.0).color(p.amber));
                 widgets::secondary_btn(ui, p, "Transcribing & summarizing locally…", false);
+                if widgets::danger_btn(ui, p, "Cancel", true).clicked() {
+                    actions.push(UiAction::MeetingCancel);
+                }
             } else if state.active {
                 if widgets::primary_btn(ui, p, "Stop & summarize", true).clicked() {
                     actions.push(UiAction::MeetingStopAndSummarize);
@@ -168,9 +171,17 @@ pub fn render_meetings(
         return;
     }
 
+    let can_resummarize = !state.active && !state.summarizing;
     for note in &state.notes {
         ui.push_id(note.id, |ui| {
-            render_meeting_note_card(ui, p, note, &mut state.expanded_transcripts, actions);
+            render_meeting_note_card(
+                ui,
+                p,
+                note,
+                can_resummarize,
+                &mut state.expanded_transcripts,
+                actions,
+            );
         });
         ui.add_space(10.0);
     }
@@ -180,6 +191,7 @@ fn render_meeting_note_card(
     ui: &mut Ui,
     p: &Palette,
     note: &MeetingNote,
+    can_resummarize: bool,
     expanded_transcripts: &mut std::collections::HashSet<String>,
     actions: &mut Vec<UiAction>,
 ) {
@@ -315,6 +327,16 @@ fn render_meeting_note_card(
                     note.transcript.clone(),
                     "Copied transcript",
                 ));
+            }
+            if widgets::ghost_btn(
+                ui,
+                p,
+                resummarize_label(&note.summary),
+                can_resummarize && has_transcript,
+            )
+            .clicked()
+            {
+                actions.push(UiAction::MeetingResummarize(note.id));
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1303,6 +1325,18 @@ fn format_meeting_ts(ts: &str) -> String {
     trimmed.to_owned()
 }
 
+fn resummarize_label(summary: &str) -> &'static str {
+    let trimmed = summary.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("Summary unavailable")
+        || trimmed.starts_with("Summarization")
+    {
+        "Retry summary"
+    } else {
+        "Re-summarize"
+    }
+}
+
 fn format_meeting_summary_copy(note: &MeetingNote) -> String {
     let mut out = String::new();
     let title = if note.title.trim().is_empty() {
@@ -1517,5 +1551,35 @@ mod tests {
         assert_eq!(by_app[0].0, "Slack");
         assert_eq!(by_app[0].1.len(), 2);
         assert_eq!(by_app[1].0, "VS Code");
+    }
+
+    #[test]
+    fn resummarize_label_distinguishes_retry_vs_populated() {
+        assert_eq!(resummarize_label(""), "Retry summary");
+        assert_eq!(resummarize_label("   \n\t "), "Retry summary");
+        assert_eq!(
+            resummarize_label("Summary unavailable (Ollama offline)."),
+            "Retry summary"
+        );
+        assert_eq!(
+            resummarize_label("  Summary unavailable: request timed out"),
+            "Retry summary"
+        );
+        assert_eq!(
+            resummarize_label("Summarization cancelled. Transcript saved."),
+            "Retry summary"
+        );
+        assert_eq!(
+            resummarize_label("Summarization failed: HTTP 500"),
+            "Retry summary"
+        );
+        assert_eq!(
+            resummarize_label("Discussed Q4 roadmap and assigned release owners."),
+            "Re-summarize"
+        );
+        assert_eq!(
+            resummarize_label("Team noted the summary unavailable issue was fixed."),
+            "Re-summarize"
+        );
     }
 }

@@ -4,6 +4,7 @@ use crate::storage::{
 };
 use crate::{audio, cleanup, models, speech};
 use serde_json::{json, Map, Value};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 const PARAKEET: &str = models::PARAKEET_ID;
@@ -199,6 +200,11 @@ fn set_setting(core: &Core, key: &str, value: &Value) -> bool {
     let string = value.as_str();
     if matches!(key, "hotkey" | "command_hotkey" | "microphone" | "speech_model")
         && core.phase() != Phase::Idle
+    {
+        return false;
+    }
+    if key == "speech_model"
+        && (core.meeting_active() || core.benchmark_active.load(Ordering::Relaxed))
     {
         return false;
     }
@@ -587,6 +593,18 @@ pub fn call(core: &Arc<Core>, name: &str, args: &[Value]) -> Option<Value> {
                 .first()
                 .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
             json!({ "ok": id.is_some_and(|id| core.delete_meeting(id)) })
+        }
+        "resummarize_meeting" => {
+            let id = args
+                .first()
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+            match id {
+                Some(id) => match core.resummarize_meeting(id) {
+                    Ok(()) => json!({ "ok": true }),
+                    Err(message) => json!({ "ok": false, "message": message }),
+                },
+                None => json!({ "ok": false, "message": "Missing or invalid meeting ID." }),
+            }
         }
         "get_local_models" => {
             let settings = core.settings.lock().unwrap().clone();
@@ -1016,5 +1034,66 @@ mod tests {
         assert_eq!(direct[0].expansion, "updated");
         assert!(upsert_snippet(&mut direct, "distinct 201st", "nope").is_err());
         assert_eq!(direct.len(), MAX_SNIPPETS);
+    }
+
+    #[test]
+    fn speech_model_change_blocked_while_benchmark_or_meeting_active_and_allowed_once_cleared() {
+        let (core, _) = Core::new(Settings::default(), true);
+
+        // Baseline: switching speech_model to PARAKEET succeeds in preview mode when idle.
+        assert_eq!(
+            call(&core, "set_setting", &[json!("speech_model"), json!(PARAKEET)]),
+            Some(json!(true))
+        );
+
+        // Blocked while benchmark_active is true.
+        core.benchmark_active.store(true, Ordering::Relaxed);
+        assert_eq!(
+            call(&core, "set_setting", &[json!("speech_model"), json!(PARAKEET)]),
+            Some(json!(false))
+        );
+        // resummarize_meeting RPC is also blocked by benchmark_active.
+        let res = call(&core, "resummarize_meeting", &[json!(1)]).unwrap();
+        assert_eq!(res["ok"], false);
+        assert!(res["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("benchmark"));
+
+        // Allowed again once benchmark_active is cleared.
+        core.benchmark_active.store(false, Ordering::Relaxed);
+        assert_eq!(
+            call(&core, "set_setting", &[json!("speech_model"), json!(PARAKEET)]),
+            Some(json!(true))
+        );
+
+        // Blocked while a meeting is active (recording) or transcribing/summarizing.
+        core.meeting.lock().unwrap().active = true;
+        assert_eq!(
+            call(&core, "set_setting", &[json!("speech_model"), json!(PARAKEET)]),
+            Some(json!(false))
+        );
+        {
+            let mut m = core.meeting.lock().unwrap();
+            m.active = false;
+            m.transcribing = true;
+        }
+        assert_eq!(
+            call(&core, "set_setting", &[json!("speech_model"), json!(PARAKEET)]),
+            Some(json!(false))
+        );
+        core.meeting.lock().unwrap().transcribing = false;
+        assert_eq!(
+            call(&core, "set_setting", &[json!("speech_model"), json!(PARAKEET)]),
+            Some(json!(true))
+        );
+
+        // resummarize_meeting RPC validates missing IDs and rejects sample mode cleanly.
+        assert_eq!(call(&core, "resummarize_meeting", &[]).unwrap()["ok"], false);
+        assert_eq!(
+            call(&core, "resummarize_meeting", &[json!(1)]).unwrap()["ok"],
+            false
+        );
     }
 }

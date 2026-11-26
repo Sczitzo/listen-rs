@@ -3,7 +3,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn input_devices() -> Vec<String> {
     cpal::default_host()
@@ -344,6 +344,10 @@ pub const MEETING_MAX_SAMPLES_16K: usize = MEETING_MAX_SECS * crate::speech::SAM
 
 const MEETING_SYNC_LAG_16K: usize = crate::speech::SAMPLE_RATE / 4; // 250 ms alignment buffer
 const MEETING_RESYNC_DRIFT_16K: usize = crate::speech::SAMPLE_RATE / 10; // 100 ms resync threshold
+const MEETING_MIC_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+const MEETING_LEVEL_HOLD: Duration = Duration::from_millis(120);
+const MEETING_LEVEL_DECAY_TAU_SECS: f32 = 0.12;
+const MEETING_LEVEL_FLOOR: f32 = 0.0005;
 
 /// Status returned when starting a dual-capture meeting recording.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,6 +443,7 @@ struct MeetingMixBuffer {
     total_samples_16k: u64,
     dropped_samples: u64,
     max_buffered_samples: usize,
+    last_mic_push: Option<Instant>,
 }
 
 impl MeetingMixBuffer {
@@ -450,6 +455,7 @@ impl MeetingMixBuffer {
             total_samples_16k: 0,
             dropped_samples: 0,
             max_buffered_samples,
+            last_mic_push: None,
         }
     }
 
@@ -460,17 +466,34 @@ impl MeetingMixBuffer {
         self.mixed.shrink_to(crate::speech::SAMPLE_RATE * 30);
         self.total_samples_16k = 0;
         self.dropped_samples = 0;
+        self.last_mic_push = None;
+    }
+
+    fn mic_is_stalled(&self, now: Instant) -> bool {
+        match self.last_mic_push {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) > MEETING_MIC_STALL_TIMEOUT,
+        }
     }
 
     fn push_mic(&mut self, samples: &[f32]) {
+        self.push_mic_at(samples, Instant::now());
+    }
+
+    fn push_mic_at(&mut self, samples: &[f32], now: Instant) {
         if samples.is_empty() {
             return;
         }
+        self.last_mic_push = Some(now);
         self.mic_pending.extend_from_slice(samples);
         self.flush_ready();
     }
 
     fn push_loopback(&mut self, samples: &[f32]) {
+        self.push_loop_at(samples, Instant::now());
+    }
+
+    fn push_loop_at(&mut self, samples: &[f32], now: Instant) {
         if samples.is_empty() {
             return;
         }
@@ -483,12 +506,25 @@ impl MeetingMixBuffer {
             if target_start > loop_len {
                 self.loop_pending.resize(target_start, 0.0);
             }
-        } else if loop_len > mic_len + MEETING_SYNC_LAG_16K * 2 {
-            // Prevent unbounded growth if mic ever pauses while loopback continues.
-            let excess = loop_len - (mic_len + MEETING_SYNC_LAG_16K);
-            self.loop_pending.drain(..excess);
         }
         self.loop_pending.extend_from_slice(samples);
+
+        let mic_len = self.mic_pending.len();
+        let loop_len = self.loop_pending.len();
+        if loop_len > mic_len + MEETING_SYNC_LAG_16K * 2 {
+            if self.mic_is_stalled(now) {
+                // Mic is silent/stalled (> 500 ms or never pushed): flush loopback into
+                // `mixed` with zero mic samples instead of discarding remote speech.
+                let flush = loop_len.saturating_sub(MEETING_SYNC_LAG_16K);
+                if flush > 0 {
+                    self.mix_prefix(flush);
+                }
+            } else {
+                // Mic is actively pushing (<= 500 ms): clamp loopback drift/bursts.
+                let excess = loop_len - (mic_len + MEETING_SYNC_LAG_16K);
+                self.loop_pending.drain(..excess);
+            }
+        }
     }
 
     fn flush_ready(&mut self) {
@@ -539,6 +575,108 @@ impl MeetingMixBuffer {
     fn total_duration_secs(&self) -> u64 {
         let total = self.total_samples_16k + self.mic_pending.len().max(self.loop_pending.len()) as u64;
         total / crate::speech::SAMPLE_RATE as u64
+    }
+}
+
+fn decay_stale_level(peak: f32, last_at: Option<Instant>, now: Instant) -> f32 {
+    match last_at {
+        None => 0.0,
+        Some(t) => {
+            let silence = now.saturating_duration_since(t);
+            if silence <= MEETING_LEVEL_HOLD {
+                peak
+            } else {
+                let over_secs = (silence - MEETING_LEVEL_HOLD).as_secs_f32();
+                let decayed = peak * (-over_secs / MEETING_LEVEL_DECAY_TAU_SECS).exp();
+                if decayed < MEETING_LEVEL_FLOOR {
+                    0.0
+                } else {
+                    decayed
+                }
+            }
+        }
+    }
+}
+
+struct MeetingLevelState {
+    mic_peak: f32,
+    mic_rms: f32,
+    last_mic_at: Option<Instant>,
+    loop_peak: f32,
+    loop_rms: f32,
+    last_loop_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct MeetingLevels {
+    state: Arc<Mutex<MeetingLevelState>>,
+    combined: Arc<AtomicU32>,
+}
+
+impl MeetingLevels {
+    fn new(combined: Arc<AtomicU32>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MeetingLevelState {
+                mic_peak: 0.0,
+                mic_rms: 0.0,
+                last_mic_at: None,
+                loop_peak: 0.0,
+                loop_rms: 0.0,
+                last_loop_at: None,
+            })),
+            combined,
+        }
+    }
+
+    fn reset(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.mic_peak = 0.0;
+        st.mic_rms = 0.0;
+        st.last_mic_at = None;
+        st.loop_peak = 0.0;
+        st.loop_rms = 0.0;
+        st.last_loop_at = None;
+        self.combined.store(0, Ordering::Relaxed);
+    }
+
+    fn update_loopback(&self, rms: f32) {
+        self.update_loopback_at(rms, Instant::now());
+    }
+
+    fn update_loopback_at(&self, rms: f32, now: Instant) {
+        let rms = if rms.is_finite() { rms.max(0.0) } else { 0.0 };
+        let mut st = self.state.lock().unwrap();
+        st.loop_peak = rms;
+        st.loop_rms = rms;
+        st.last_loop_at = Some(now);
+        st.mic_rms = decay_stale_level(st.mic_peak, st.last_mic_at, now);
+        self.combined
+            .store(st.loop_rms.max(st.mic_rms).to_bits(), Ordering::Relaxed);
+    }
+
+    fn update_mic(&self, rms: f32) {
+        self.update_mic_at(rms, Instant::now());
+    }
+
+    fn update_mic_at(&self, rms: f32, now: Instant) {
+        let rms = if rms.is_finite() { rms.max(0.0) } else { 0.0 };
+        let mut st = self.state.lock().unwrap();
+        st.mic_peak = rms;
+        st.mic_rms = rms;
+        st.last_mic_at = Some(now);
+        st.loop_rms = decay_stale_level(st.loop_peak, st.last_loop_at, now);
+        self.combined
+            .store(st.mic_rms.max(st.loop_rms).to_bits(), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn loop_level(&self) -> f32 {
+        self.state.lock().unwrap().loop_rms
+    }
+
+    #[cfg(test)]
+    fn combined_level(&self) -> f32 {
+        f32::from_bits(self.combined.load(Ordering::Relaxed))
     }
 }
 
@@ -615,25 +753,20 @@ fn meeting_audio_thread(
     mix: Arc<Mutex<MeetingMixBuffer>>,
 ) {
     let mut current: Option<ActiveMeeting> = None;
-    let mic_level = Arc::new(AtomicU32::new(0));
-    let loop_level = Arc::new(AtomicU32::new(0));
+    let levels = MeetingLevels::new(level);
 
     for cmd in rx {
         match cmd {
             MeetingCmd::Start(device_name, include_system_audio, reply) => {
                 current = None;
-                mic_level.store(0, Ordering::Relaxed);
-                loop_level.store(0, Ordering::Relaxed);
-                level.store(0, Ordering::Relaxed);
+                levels.reset();
                 mix.lock().unwrap().reset();
 
                 match open_meeting_streams(
                     &device_name,
                     include_system_audio,
                     mix.clone(),
-                    level.clone(),
-                    mic_level.clone(),
-                    loop_level.clone(),
+                    levels.clone(),
                 ) {
                     Ok((active, info)) => {
                         current = Some(active);
@@ -647,17 +780,13 @@ fn meeting_audio_thread(
             MeetingCmd::Stop(reply) => {
                 // Drop both streams before draining the mix buffer so no callback runs after flush.
                 drop(current.take());
-                mic_level.store(0, Ordering::Relaxed);
-                loop_level.store(0, Ordering::Relaxed);
-                level.store(0, Ordering::Relaxed);
+                levels.reset();
                 let tail = mix.lock().unwrap().finish();
                 let _ = reply.send(tail);
             }
             MeetingCmd::Cancel => {
                 drop(current.take());
-                mic_level.store(0, Ordering::Relaxed);
-                loop_level.store(0, Ordering::Relaxed);
-                level.store(0, Ordering::Relaxed);
+                levels.reset();
                 mix.lock().unwrap().reset();
             }
         }
@@ -668,9 +797,7 @@ fn open_meeting_streams(
     mic_name: &str,
     include_system_audio: bool,
     mix: Arc<Mutex<MeetingMixBuffer>>,
-    combined_level: Arc<AtomicU32>,
-    mic_level: Arc<AtomicU32>,
-    loop_level: Arc<AtomicU32>,
+    levels: MeetingLevels,
 ) -> Result<(ActiveMeeting, MeetingStartInfo), String> {
     let host = cpal::default_host();
     let mic_device = select_input(
@@ -694,14 +821,12 @@ fn open_meeting_streams(
         mic_fmt,
         mix.clone(),
         false,
-        mic_level.clone(),
-        loop_level.clone(),
-        combined_level.clone(),
+        levels.clone(),
     )?;
     mic_stream.play().map_err(|e| format!("microphone: {e}"))?;
 
     let (loopback_stream, loopback_label, loopback_warning) = if include_system_audio {
-        match open_loopback_stream(&host, mix, loop_level, mic_level, combined_level) {
+        match open_loopback_stream(&host, mix, levels) {
             Ok((stream, label)) => (Some(stream), Some(label), None),
             Err(reason) => (None, None, Some(reason)),
         }
@@ -727,9 +852,7 @@ fn open_meeting_streams(
 fn open_loopback_stream(
     host: &cpal::Host,
     mix: Arc<Mutex<MeetingMixBuffer>>,
-    loop_level: Arc<AtomicU32>,
-    mic_level: Arc<AtomicU32>,
-    combined_level: Arc<AtomicU32>,
+    levels: MeetingLevels,
 ) -> Result<(cpal::Stream, String), String> {
     let device = host
         .default_output_device()
@@ -748,9 +871,7 @@ fn open_loopback_stream(
         fmt,
         mix,
         true,
-        loop_level,
-        mic_level,
-        combined_level,
+        levels,
     )?;
     stream
         .play()
@@ -758,29 +879,26 @@ fn open_loopback_stream(
     Ok((stream, label))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_meeting_stream_any(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     fmt: cpal::SampleFormat,
     mix: Arc<Mutex<MeetingMixBuffer>>,
     is_loopback: bool,
-    own_level: Arc<AtomicU32>,
-    peer_level: Arc<AtomicU32>,
-    combined_level: Arc<AtomicU32>,
+    levels: MeetingLevels,
 ) -> Result<cpal::Stream, String> {
     match fmt {
         cpal::SampleFormat::F32 => build_meeting_stream::<f32>(
-            device, config, mix, is_loopback, own_level, peer_level, combined_level,
+            device, config, mix, is_loopback, levels,
         ),
         cpal::SampleFormat::I16 => build_meeting_stream::<i16>(
-            device, config, mix, is_loopback, own_level, peer_level, combined_level,
+            device, config, mix, is_loopback, levels,
         ),
         cpal::SampleFormat::U16 => build_meeting_stream::<u16>(
-            device, config, mix, is_loopback, own_level, peer_level, combined_level,
+            device, config, mix, is_loopback, levels,
         ),
         cpal::SampleFormat::I32 => build_meeting_stream::<i32>(
-            device, config, mix, is_loopback, own_level, peer_level, combined_level,
+            device, config, mix, is_loopback, levels,
         ),
         other => Err(format!(
             "{} format ({other:?}) isn't supported",
@@ -789,15 +907,12 @@ fn build_meeting_stream_any(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_meeting_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mix: Arc<Mutex<MeetingMixBuffer>>,
     is_loopback: bool,
-    own_level: Arc<AtomicU32>,
-    peer_level: Arc<AtomicU32>,
-    combined_level: Arc<AtomicU32>,
+    levels: MeetingLevels,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample,
@@ -828,9 +943,11 @@ where
                 }
                 if !mono_scratch.is_empty() {
                     let rms = (sum_sq / mono_scratch.len() as f32).sqrt();
-                    own_level.store(rms.to_bits(), Ordering::Relaxed);
-                    let peer = f32::from_bits(peer_level.load(Ordering::Relaxed));
-                    combined_level.store(rms.max(peer).to_bits(), Ordering::Relaxed);
+                    if is_loopback {
+                        levels.update_loopback(rms);
+                    } else {
+                        levels.update_mic(rms);
+                    }
 
                     out_16k.clear();
                     resampler.push(&mono_scratch, &mut out_16k);
@@ -1122,5 +1239,131 @@ mod tests {
         let out = capped.finish();
         assert_eq!(out.len(), 1_000);
         assert!(capped.dropped_samples >= 9_000);
+    }
+
+    #[test]
+    fn meeting_mix_buffer_advances_loopback_when_mic_stalls() {
+        let t0 = Instant::now();
+
+        // 1. Mic has never pushed (`last_mic_push == None`): loopback audio must advance
+        //    into `mixed` with zero mic samples instead of being drained/discarded.
+        let mut no_mic = MeetingMixBuffer::new(MEETING_MAX_SAMPLES_16K);
+        for i in 0..150 {
+            // 150 * 160 = 24_000 samples (1.5 s) of loopback audio.
+            let t = t0 + Duration::from_millis(i * 10);
+            no_mic.push_loop_at(&vec![0.25f32; 160], t);
+        }
+        let chunk = no_mic.take_chunk();
+        assert!(
+            chunk.len() >= 16_000,
+            "expected loopback audio to advance into mixed when mic never pushed, got {} samples",
+            chunk.len()
+        );
+        assert!(chunk.iter().all(|&s| (s - 0.25).abs() < 1e-5));
+        let tail = no_mic.finish();
+        assert_eq!(
+            chunk.len() + tail.len(),
+            24_000,
+            "no loopback audio should be discarded when mic never pushed"
+        );
+        assert!(tail.iter().all(|&s| (s - 0.25).abs() < 1e-5));
+
+        // 2. Mic pushed at t0, then stalls (> 500 ms silent): loopback audio must flush into
+        //    `mixed` with zero mic samples after the buffered mic prefix.
+        let mut stalled = MeetingMixBuffer::new(MEETING_MAX_SAMPLES_16K);
+        stalled.push_mic_at(&vec![0.1f32; 16_000], t0);
+        let initial = stalled.take_chunk();
+        assert_eq!(initial.len(), 16_000 - MEETING_SYNC_LAG_16K);
+
+        // Stall mic for > 500 ms, then stream 1.5 s of loopback audio.
+        let stall_start = t0 + Duration::from_millis(600);
+        for i in 0..150 {
+            let t = stall_start + Duration::from_millis(i * 10);
+            stalled.push_loop_at(&vec![0.3f32; 160], t);
+        }
+        let stalled_chunk = stalled.take_chunk();
+        assert!(
+            stalled_chunk.len() >= 16_000,
+            "expected stalled-mic loopback to advance into mixed, got {} samples",
+            stalled_chunk.len()
+        );
+        // Count pure-loopback (0.3) + overlapped (0.4) samples across chunk + tail.
+        let stalled_tail = stalled.finish();
+        let loop_samples: usize = stalled_chunk
+            .iter()
+            .chain(stalled_tail.iter())
+            .filter(|&&s| (s - 0.3).abs() < 1e-4 || (s - 0.4).abs() < 1e-4)
+            .count();
+        assert_eq!(
+            loop_samples, 24_000,
+            "all 24_000 loopback samples must be preserved when mic stalls"
+        );
+
+        // 3. Active-mic drift clamping (<= 500 ms since last mic push): loopback excess
+        //    must still be clamped instead of flushing zero-mic audio into `mixed`.
+        let mut active = MeetingMixBuffer::new(MEETING_MAX_SAMPLES_16K);
+        active.push_mic_at(&vec![0.1f32; 160], t0);
+        // Push > 2 * MEETING_SYNC_LAG_16K of loopback at exact 500 ms boundary (still active).
+        let active_t = t0 + Duration::from_millis(500);
+        for _ in 0..100 {
+            active.push_loop_at(&vec![0.25f32; 160], active_t);
+        }
+        assert!(
+            active.take_chunk().is_empty(),
+            "active mic (<= 500 ms) must not flush loopback with zero mic samples"
+        );
+        assert!(
+            active.loop_pending.len() <= active.mic_pending.len() + MEETING_SYNC_LAG_16K * 2,
+            "active mic drift clamping must bound loop_pending, got {}",
+            active.loop_pending.len()
+        );
+
+        // Once clock advances past 500 ms without mic pushes, further loopback advances into mixed.
+        let past_stall = t0 + Duration::from_millis(501);
+        active.push_loop_at(&vec![0.25f32; 12_000], past_stall);
+        assert!(
+            !active.take_chunk().is_empty(),
+            "loopback must flush into mixed once mic stall exceeds 500 ms"
+        );
+
+        // 4. Loopback level decays smoothly toward 0.0 when WASAPI loopback stops firing
+        //    callbacks on speaker silence while mic callbacks continue.
+        let combined = Arc::new(AtomicU32::new(0));
+        let levels = MeetingLevels::new(combined);
+        levels.update_loopback_at(0.5, t0);
+        assert!((levels.loop_level() - 0.5).abs() < 1e-5);
+        assert!((levels.combined_level() - 0.5).abs() < 1e-5);
+
+        // Within normal packet jitter (50 ms), loopback level holds steady.
+        levels.update_mic_at(0.02, t0 + Duration::from_millis(50));
+        assert!((levels.loop_level() - 0.5).abs() < 1e-5);
+        assert!((levels.combined_level() - 0.5).abs() < 1e-5);
+
+        // After 250 ms of loopback silence, loop_level has started decaying.
+        levels.update_mic_at(0.02, t0 + Duration::from_millis(250));
+        let mid_loop = levels.loop_level();
+        assert!(
+            mid_loop < 0.45 && mid_loop > 0.01,
+            "expected partial decay at 250 ms silence, got {mid_loop}"
+        );
+
+        // After extended loopback silence (1.5 s), loop_level decays to 0.0 and
+        // combined_level falls back to mic level instead of remaining frozen.
+        levels.update_mic_at(0.02, t0 + Duration::from_millis(1500));
+        assert_eq!(
+            levels.loop_level(),
+            0.0,
+            "loop_level must decay to 0.0 on extended loopback silence"
+        );
+        assert!(
+            (levels.combined_level() - 0.02).abs() < 1e-5,
+            "combined_level should reflect mic RMS once loopback decays, got {}",
+            levels.combined_level()
+        );
+
+        // When speaker audio resumes, loop_level immediately recovers.
+        levels.update_loopback_at(0.4, t0 + Duration::from_millis(1600));
+        assert!((levels.loop_level() - 0.4).abs() < 1e-5);
+        assert!((levels.combined_level() - 0.4).abs() < 1e-5);
     }
 }

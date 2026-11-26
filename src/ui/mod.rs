@@ -281,6 +281,7 @@ pub enum UiAction {
     MeetingStopAndSummarize,
     MeetingCancel,
     MeetingDelete(String),
+    MeetingResummarize(u64),
 
     // History
     ClearHistory,

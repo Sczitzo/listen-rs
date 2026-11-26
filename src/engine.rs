@@ -47,6 +47,7 @@ pub enum Cmd {
     CancelLantern { generation: u64 },
     StartMeeting { include_system_audio: bool, reply: mpsc::SyncSender<Result<audio::MeetingStartInfo, String>> },
     StopMeeting { reply: mpsc::SyncSender<Result<(), String>> },
+    ResummarizeMeeting { id: u64, reply: mpsc::SyncSender<Result<(), String>> },
     CancelMeeting,
     Lab { action: LabAction, text: String, instruction: String },
     Deliver { text: String, target: Option<Target> },
@@ -141,6 +142,17 @@ impl Default for LiveCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeetingSnapshot {
+    pub active: bool,
+    pub transcribing: bool,
+    pub elapsed_secs: f32,
+    pub status: String,
+    pub loopback_warning: String,
+    pub notes_ver: u64,
+    pub notes: Option<Vec<crate::meeting::MeetingNote>>,
+}
+
 pub struct MeetingState {
     pub active: bool,
     pub transcribing: bool,
@@ -150,7 +162,10 @@ pub struct MeetingState {
     pub loopback_warning: Option<String>,
     pub status: String,
     pub notes: Vec<crate::meeting::MeetingNote>,
+    pub notes_ver: u64,
     gen: u64,
+    draft_id: u64,
+    draft_ts: String,
 }
 
 fn sample_meeting_notes() -> Vec<crate::meeting::MeetingNote> {
@@ -179,6 +194,7 @@ pub struct Core {
     pub preview: bool,
     pub capture_paused: std::sync::atomic::AtomicBool,
     pub draft_delivery_pending: AtomicBool,
+    pub benchmark_active: AtomicBool,
     #[cfg(windows)]
     pub controller_capture: Mutex<Option<crate::controller::Capture>>,
     tx: Sender<Cmd>,
@@ -190,10 +206,20 @@ impl Core {
     pub fn new(settings: Settings, preview: bool) -> (Arc<Core>, Receiver<UiEvent>) {
         let (tx, rx) = mpsc::channel();
         let (ui_tx, ui_rx) = mpsc::channel();
+        let mut initial_meeting_status = String::new();
         let initial_notes = if preview {
             sample_meeting_notes()
         } else {
-            crate::meeting::load_meetings()
+            let mut loaded = crate::meeting::load_meetings();
+            if let Some(msg) = recover_meeting_draft_into(
+                &mut loaded,
+                crate::meeting::load_draft(),
+                crate::meeting::save_meetings,
+                crate::meeting::clear_draft,
+            ) {
+                initial_meeting_status = msg;
+            }
+            loaded
         };
         let core = Arc::new(Core {
             shared: Mutex::new(Shared {
@@ -224,14 +250,18 @@ impl Core {
                 elapsed_secs: 0,
                 loopback_active: false,
                 loopback_warning: None,
-                status: String::new(),
+                status: initial_meeting_status,
                 notes: initial_notes,
+                notes_ver: 0,
                 gen: 0,
+                draft_id: 0,
+                draft_ts: String::new(),
             }),
             live_cache: (Mutex::new(LiveCache::default()), Condvar::new()),
             preview,
             capture_paused: std::sync::atomic::AtomicBool::new(false),
             draft_delivery_pending: AtomicBool::new(false),
+            benchmark_active: AtomicBool::new(false),
             #[cfg(windows)]
             controller_capture: Mutex::new(None),
             tx,
@@ -252,6 +282,10 @@ impl Core {
         m.active || m.transcribing
     }
 
+    pub(crate) fn can_reload_engine(&self) -> bool {
+        !self.meeting_active() && !self.benchmark_active.load(Ordering::Acquire)
+    }
+
     pub fn meeting_snapshot(&self) -> serde_json::Value {
         let m = self.meeting.lock().unwrap();
         let elapsed_secs = if m.active {
@@ -270,11 +304,38 @@ impl Core {
         })
     }
 
+    pub fn meeting_typed_snapshot(&self, known_notes_ver: Option<u64>) -> MeetingSnapshot {
+        let m = self.meeting.lock().unwrap();
+        let elapsed_secs = if m.active {
+            m.started
+                .map_or(m.elapsed_secs as f32, |t| t.elapsed().as_secs_f32())
+        } else {
+            m.elapsed_secs as f32
+        };
+        let notes = if known_notes_ver != Some(m.notes_ver) {
+            Some(m.notes.clone())
+        } else {
+            None
+        };
+        MeetingSnapshot {
+            active: m.active,
+            transcribing: m.transcribing,
+            elapsed_secs,
+            status: m.status.clone(),
+            loopback_warning: m.loopback_warning.clone().unwrap_or_default(),
+            notes_ver: m.notes_ver,
+            notes,
+        }
+    }
+
     pub fn start_meeting(&self) -> Result<audio::MeetingStartInfo, String> {
         self.start_meeting_with_loopback(true)
     }
 
     pub fn start_meeting_with_loopback(&self, include_system_audio: bool) -> Result<audio::MeetingStartInfo, String> {
+        if self.benchmark_active.load(Ordering::Acquire) {
+            return Err("Finish the speech benchmark before starting a meeting.".into());
+        }
         if self.preview {
             return Err("Meeting recording is unavailable in sample mode.".into());
         }
@@ -306,25 +367,110 @@ impl Core {
             .unwrap_or_else(|_| Err("Timed out stopping meeting recording.".into()))
     }
 
-    pub fn cancel_meeting(&self) {
+    pub fn resummarize_meeting(&self, id: u64) -> Result<(), String> {
+        if self.benchmark_active.load(Ordering::Acquire) {
+            return Err("Finish the speech benchmark before re-summarizing a meeting.".into());
+        }
         if self.preview {
+            return Err("Re-summarizing is unavailable in sample mode.".into());
+        }
+        if self.phase() != Phase::Idle {
+            return Err("Finish the current dictation before re-summarizing a meeting.".into());
+        }
+        if self.meeting_active() {
+            return Err("A meeting recording or summarization is already in progress.".into());
+        }
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(Cmd::ResummarizeMeeting { id, reply })
+            .map_err(|_| "Listen background controller is unavailable.".to_owned())?;
+        self.repaint();
+        rx.recv_timeout(Duration::from_secs(6))
+            .unwrap_or_else(|_| Err("Timed out starting meeting re-summarization.".into()))
+    }
+
+    fn apply_cancel_meeting_state(&self) -> (bool, bool) {
+        let mut m = self.meeting.lock().unwrap();
+        let was_active = m.active;
+        let was_transcribing = m.transcribing;
+        if !was_active && !was_transcribing {
+            return (false, false);
+        }
+        m.gen = m.gen.wrapping_add(1);
+        m.active = false;
+        m.transcribing = false;
+        m.started = None;
+        if was_active {
+            m.elapsed_secs = 0;
+            m.loopback_active = false;
+            m.loopback_warning = None;
+            m.status = "Meeting recording discarded.".into();
+        } else {
+            m.status = "Summarization canceled.".into();
+        }
+        (was_active, was_transcribing)
+    }
+
+    pub fn cancel_meeting(&self) {
+        let (was_active, was_transcribing) = self.apply_cancel_meeting_state();
+        if self.preview {
+            if was_active || was_transcribing {
+                self.repaint();
+            }
             return;
+        }
+        if was_active || was_transcribing {
+            crate::meeting::clear_draft();
+            self.cue(Cue::Cancel);
         }
         let _ = self.tx.send(Cmd::CancelMeeting);
         self.repaint();
     }
 
     pub fn delete_meeting(&self, id: u64) -> bool {
-        let mut m = self.meeting.lock().unwrap();
-        let before = m.notes.len();
-        m.notes.retain(|note| note.id != id);
-        if m.notes.len() == before {
-            return false;
+        let preview = self.preview;
+        self.delete_meeting_with_saver(id, move |notes| {
+            if preview {
+                Ok(())
+            } else {
+                crate::meeting::save_meetings(notes)
+            }
+        })
+    }
+
+    pub(crate) fn delete_meeting_with_saver<S>(&self, id: u64, mut save: S) -> bool
+    where
+        S: FnMut(&[crate::meeting::MeetingNote]) -> std::io::Result<()>,
+    {
+        loop {
+            let (ver, candidate) = {
+                let m = self.meeting.lock().unwrap();
+                if !m.notes.iter().any(|note| note.id == id) {
+                    return false;
+                }
+                let mut cloned = m.notes.clone();
+                cloned.retain(|note| note.id != id);
+                (m.notes_ver, cloned)
+            };
+
+            // Persist OUTSIDE `core.meeting` lock so a disk failure leaves `m.notes` intact.
+            if let Err(err) = save(&candidate) {
+                let mut m = self.meeting.lock().unwrap();
+                m.status = format!("Couldn't delete meeting note: {err}");
+                drop(m);
+                self.repaint();
+                return false;
+            }
+
+            let mut m = self.meeting.lock().unwrap();
+            if m.notes_ver == ver {
+                m.notes = candidate;
+                m.notes_ver = m.notes_ver.wrapping_add(1);
+                drop(m);
+                self.repaint();
+                return true;
+            }
         }
-        if !self.preview && crate::meeting::save_meetings(&m.notes).is_err() {
-            return false;
-        }
-        true
     }
 
     pub fn set_ctx(&self, ctx: egui::Context) {
@@ -720,6 +866,9 @@ fn live_preview(core: Arc<Core>, tap: audio::LiveTap, gen: u64, quiet_mode: bool
 }
 
 fn load_engine(core: &Arc<Core>) {
+    if !core.can_reload_engine() {
+        return;
+    }
     let s = core.settings();
     {
         let mut sh = core.shared.lock().unwrap();
@@ -727,6 +876,9 @@ fn load_engine(core: &Arc<Core>) {
         sh.status = "Loading the speech model…".into();
     }
     core.repaint();
+    if !core.can_reload_engine() {
+        return;
+    }
     *core.engine.lock().unwrap() = None; // free the old one first
     if core.preview {
         // Preview runs (screenshots) only check that the files are there.
@@ -834,23 +986,186 @@ fn matched_snippet_triggers<'a>(
         .collect()
 }
 
-fn transcribe_meeting_audio(core: &Core, samples: &[f32], vocab: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    for chunk in crate::meeting::chunk_audio_16k(samples, 25) {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MeetingChunkResult {
+    parts: Vec<String>,
+    failed_chunks: usize,
+    last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct MeetingDrainOutput {
+    parts: Vec<String>,
+    carry: Vec<f32>,
+    failed_chunks: usize,
+    last_error: Option<String>,
+}
+
+fn meeting_chunk_error_warning(failed_chunks: usize, last_error: Option<&str>) -> Option<String> {
+    if failed_chunks == 0 {
+        return None;
+    }
+    let noun = if failed_chunks == 1 {
+        "audio chunk"
+    } else {
+        "audio chunks"
+    };
+    match last_error.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(err) => Some(format!(
+            "Warning: {failed_chunks} {noun} failed to transcribe ({err})."
+        )),
+        None => Some(format!(
+            "Warning: {failed_chunks} {noun} failed to transcribe."
+        )),
+    }
+}
+
+fn transcribe_meeting_chunks_with<F, C>(
+    chunks: &[&[f32]],
+    mut is_cancelled: C,
+    mut transcribe_chunk: F,
+) -> MeetingChunkResult
+where
+    C: FnMut() -> bool,
+    F: FnMut(&[f32]) -> Result<String, String>,
+{
+    let mut result = MeetingChunkResult::default();
+    for &chunk in chunks {
+        if is_cancelled() {
+            break;
+        }
         if speech::peak_window_rms(chunk) < audio::NORMAL_SILENCE_RMS {
             continue;
         }
-        let mut eng_guard = core.engine.lock().unwrap();
-        if let Some(eng) = eng_guard.as_mut() {
-            if let Ok(text) = eng.transcribe(chunk, vocab) {
+        match transcribe_chunk(chunk) {
+            Ok(text) => {
+                if is_cancelled() {
+                    break;
+                }
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    parts.push(trimmed.to_owned());
+                    result.parts.push(trimmed.to_owned());
                 }
+            }
+            Err(err) => {
+                if is_cancelled() {
+                    break;
+                }
+                result.failed_chunks += 1;
+                result.last_error = Some(err);
             }
         }
     }
-    parts
+    result
+}
+
+fn transcribe_meeting_audio(
+    core: &Core,
+    samples: &[f32],
+    vocab: &str,
+    my_gen: u64,
+) -> MeetingChunkResult {
+    let chunks = crate::meeting::chunk_audio_16k(samples, 25);
+    transcribe_meeting_chunks_with(
+        &chunks,
+        || core.meeting.lock().unwrap().gen != my_gen,
+        |chunk| {
+            let mut eng_guard = core.engine.lock().unwrap();
+            match eng_guard.as_mut() {
+                Some(eng) => eng.transcribe(chunk, vocab),
+                None => Err("speech engine isn't loaded".into()),
+            }
+        },
+    )
+}
+
+fn persist_meeting_notes_for_gen<M, S>(
+    core: &Core,
+    my_gen: u64,
+    mut mutate: M,
+    mut save: S,
+) -> Result<bool, String>
+where
+    M: FnMut(&mut Vec<crate::meeting::MeetingNote>) -> bool,
+    S: FnMut(&[crate::meeting::MeetingNote]) -> std::io::Result<()>,
+{
+    loop {
+        let (ver, candidate) = {
+            let m = core.meeting.lock().unwrap();
+            if m.gen != my_gen {
+                return Ok(false);
+            }
+            let mut cloned = m.notes.clone();
+            if !mutate(&mut cloned) {
+                return Ok(false);
+            }
+            cloned.truncate(crate::meeting::MAX_MEETINGS);
+            (m.notes_ver, cloned)
+        };
+
+        // Always write to disk OUTSIDE `core.meeting` lock before committing.
+        save(&candidate).map_err(|e| e.to_string())?;
+
+        let mut m = core.meeting.lock().unwrap();
+        if m.gen != my_gen {
+            return Ok(false);
+        }
+        if m.notes_ver == ver {
+            m.notes = candidate;
+            m.notes_ver = m.notes_ver.wrapping_add(1);
+            return Ok(true);
+        }
+    }
+}
+
+fn recover_meeting_draft_into<S, C>(
+    notes: &mut Vec<crate::meeting::MeetingNote>,
+    draft: Option<crate::meeting::MeetingDraft>,
+    save_notes: S,
+    clear_draft: C,
+) -> Option<String>
+where
+    S: FnOnce(&[crate::meeting::MeetingNote]) -> std::io::Result<()>,
+    C: FnOnce(),
+{
+    let draft = draft?;
+    let transcript = join_non_empty(&draft.parts, "");
+    if transcript.is_empty() {
+        clear_draft();
+        return None;
+    }
+    let ts = if draft.ts.trim().is_empty() {
+        storage::now_stamp().0
+    } else {
+        draft.ts
+    };
+    let max_existing = notes.iter().map(|n| n.id).max().unwrap_or(0);
+    let id = draft.id.max(max_existing.saturating_add(1));
+    let mut candidate = notes.clone();
+    candidate.insert(
+        0,
+        crate::meeting::MeetingNote {
+            id,
+            ts: ts.clone(),
+            title: format!("Recovered Meeting — {ts}"),
+            duration_secs: draft.duration_secs,
+            loopback_used: draft.loopback_used,
+            transcript,
+            summary: String::new(),
+            action_items: Vec::new(),
+        },
+    );
+    candidate.truncate(crate::meeting::MAX_MEETINGS);
+    match save_notes(&candidate) {
+        Ok(()) => {
+            *notes = candidate;
+            clear_draft();
+            Some("Recovered unsaved meeting transcript from previous session.".into())
+        }
+        Err(err) => Some(format!(
+            "Found unsaved meeting draft, but couldn't save it: {err}"
+        )),
+    }
 }
 
 fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
@@ -873,7 +1188,7 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
     }
     let recorder = Recorder::spawn(core.level.clone());
     let meeting_recorder = Arc::new(Mutex::new(audio::MeetingRecorder::spawn(core.level.clone())));
-    let mut meeting_drain_handle: Option<std::thread::JoinHandle<Vec<String>>> = None;
+    let mut meeting_drain_handle: Option<std::thread::JoinHandle<MeetingDrainOutput>> = None;
     let mut recording_clipboard = None;
     let mut active_command: Option<ActiveCommand> = None;
 
@@ -1149,6 +1464,10 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                 }
             }
             Cmd::StartMeeting { include_system_audio, reply } => {
+                if core.benchmark_active.load(Ordering::Acquire) {
+                    let _ = reply.send(Err("Finish the speech benchmark before starting a meeting.".into()));
+                    continue;
+                }
                 if core.phase() != Phase::Idle {
                     let _ = reply.send(Err("Finish the current dictation before starting a meeting.".into()));
                     continue;
@@ -1173,8 +1492,11 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                 let start_res = meeting_recorder.lock().unwrap().start_meeting(&s.microphone, include_system_audio);
                 match start_res {
                     Ok(info) => {
-                        let my_gen = {
+                        let (draft_ts, unix) = storage::now_stamp();
+                        let (my_gen, draft_id) = {
                             let mut m = core.meeting.lock().unwrap();
+                            let max_existing = m.notes.iter().map(|n| n.id).max().unwrap_or(0);
+                            let draft_id = unix.max(max_existing.saturating_add(1));
                             m.gen = m.gen.wrapping_add(1);
                             m.active = true;
                             m.transcribing = false;
@@ -1182,19 +1504,24 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                             m.elapsed_secs = 0;
                             m.loopback_active = info.loopback_active;
                             m.loopback_warning = info.loopback_warning.clone();
+                            m.draft_id = draft_id;
+                            m.draft_ts = draft_ts.clone();
                             m.status = match &info.loopback_label {
                                 Some(lb) => format!("Recording meeting ({} + {lb})…", info.mic_label),
                                 None => format!("Recording meeting ({} · mic only)…", info.mic_label),
                             };
-                            m.gen
+                            (m.gen, draft_id)
                         };
                         let drain_core = core.clone();
                         let drain_rec = meeting_recorder.clone();
                         let vocab = s.vocab.clone();
+                        let loopback_used = info.loopback_active;
                         meeting_drain_handle = std::thread::Builder::new()
                             .name("meeting-drain".into())
                             .spawn(move || {
-                                let mut chunks_text: Vec<String> = Vec::new();
+                                const MAX_CHUNK_SECS: usize = 25;
+                                let max_chunk_samples = MAX_CHUNK_SECS * speech::SAMPLE_RATE;
+                                let mut out = MeetingDrainOutput::default();
                                 loop {
                                     std::thread::sleep(Duration::from_millis(500));
                                     let keep_going = {
@@ -1205,15 +1532,91 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                                         break;
                                     }
                                     let ready = drain_rec.lock().unwrap().buffered_len_16k();
-                                    if ready >= 25 * speech::SAMPLE_RATE {
+                                    if ready > 0 && out.carry.len() + ready >= max_chunk_samples {
+                                        let still_active = {
+                                            let m = drain_core.meeting.lock().unwrap();
+                                            m.active && m.gen == my_gen
+                                        };
+                                        if !still_active {
+                                            break;
+                                        }
                                         let pcm = drain_rec.lock().unwrap().take_chunk_16k();
-                                        if !pcm.is_empty() {
-                                            let parts = transcribe_meeting_audio(&drain_core, &pcm, &vocab);
-                                            chunks_text.extend(parts);
+                                        let same_gen = drain_core.meeting.lock().unwrap().gen == my_gen;
+                                        if !same_gen {
+                                            break;
+                                        }
+                                        out.carry.extend_from_slice(&pcm);
+                                    }
+                                    while let Some((chunk, tail)) =
+                                        crate::meeting::split_next_quiet_chunk_16k(&out.carry, MAX_CHUNK_SECS)
+                                    {
+                                        let still_active = {
+                                            let m = drain_core.meeting.lock().unwrap();
+                                            m.active && m.gen == my_gen
+                                        };
+                                        if !still_active {
+                                            break;
+                                        }
+                                        let chunk_owned = chunk.to_vec();
+                                        let tail_owned = tail.to_vec();
+                                        let chunk_res = transcribe_meeting_chunks_with(
+                                            &[chunk_owned.as_slice()],
+                                            || drain_core.meeting.lock().unwrap().gen != my_gen,
+                                            |slice| {
+                                                let mut eng_guard = drain_core.engine.lock().unwrap();
+                                                match eng_guard.as_mut() {
+                                                    Some(eng) => eng.transcribe(slice, &vocab),
+                                                    None => Err("speech engine isn't loaded".into()),
+                                                }
+                                            },
+                                        );
+                                        if drain_core.meeting.lock().unwrap().gen != my_gen {
+                                            return out;
+                                        }
+                                        out.carry = tail_owned;
+                                        let added_text = !chunk_res.parts.is_empty();
+                                        out.parts.extend(chunk_res.parts);
+                                        if chunk_res.failed_chunks > 0 {
+                                            out.failed_chunks += chunk_res.failed_chunks;
+                                            if chunk_res.last_error.is_some() {
+                                                out.last_error = chunk_res.last_error;
+                                            }
+                                            if let Some(warn) = meeting_chunk_error_warning(
+                                                out.failed_chunks,
+                                                out.last_error.as_deref(),
+                                            ) {
+                                                let mut m = drain_core.meeting.lock().unwrap();
+                                                if m.gen == my_gen && m.active {
+                                                    m.status = warn;
+                                                }
+                                                drop(m);
+                                                drain_core.repaint();
+                                            }
+                                        }
+                                        if !drain_core.preview && added_text {
+                                            let duration_secs = drain_rec.lock().unwrap().total_duration_secs();
+                                            if drain_core.meeting.lock().unwrap().gen == my_gen {
+                                                let draft = crate::meeting::MeetingDraft {
+                                                    id: draft_id,
+                                                    ts: draft_ts.clone(),
+                                                    loopback_used,
+                                                    duration_secs,
+                                                    parts: out.parts.clone(),
+                                                };
+                                                let _ = crate::meeting::save_draft(&draft);
+                                                let stale_idle = {
+                                                    let m = drain_core.meeting.lock().unwrap();
+                                                    m.gen != my_gen && !m.active && !m.transcribing
+                                                };
+                                                if stale_idle {
+                                                    crate::meeting::clear_draft();
+                                                    return out;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                                chunks_text
+                                out
                             })
                             .ok();
                         core.cue(Cue::Start);
@@ -1237,10 +1640,16 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                         m.transcribing = true;
                         m.elapsed_secs = elapsed_wall;
                         m.status = "Transcribing remaining audio…".into();
-                        Some((m.gen, m.loopback_active, elapsed_wall))
+                        Some((
+                            m.gen,
+                            m.loopback_active,
+                            elapsed_wall,
+                            m.draft_id,
+                            m.draft_ts.clone(),
+                        ))
                     }
                 };
-                let Some((my_gen, loopback_used, elapsed_wall)) = stop_info else {
+                let Some((my_gen, loopback_used, elapsed_wall, draft_id, draft_ts)) = stop_info else {
                     let _ = reply.send(Err("No meeting recording is active.".into()));
                     continue;
                 };
@@ -1261,26 +1670,120 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                     .name("meeting-finalize".into())
                     .spawn(move || {
                         let s = fin_core.settings();
-                        let mut parts = drain_handle
+                        let MeetingDrainOutput {
+                            mut parts,
+                            mut carry,
+                            mut failed_chunks,
+                            mut last_error,
+                        } = drain_handle
                             .and_then(|h| h.join().ok())
                             .unwrap_or_default();
-                        if !tail.is_empty() {
-                            parts.extend(transcribe_meeting_audio(&fin_core, &tail, &s.vocab));
-                        }
                         if fin_core.meeting.lock().unwrap().gen != my_gen {
                             return;
                         }
+                        carry.extend_from_slice(&tail);
+                        if !carry.is_empty() {
+                            let tail_res = transcribe_meeting_audio(&fin_core, &carry, &s.vocab, my_gen);
+                            if fin_core.meeting.lock().unwrap().gen != my_gen {
+                                return;
+                            }
+                            parts.extend(tail_res.parts);
+                            failed_chunks += tail_res.failed_chunks;
+                            if tail_res.last_error.is_some() {
+                                last_error = tail_res.last_error;
+                            }
+                        }
+                        let chunk_warning =
+                            meeting_chunk_error_warning(failed_chunks, last_error.as_deref());
                         let transcript = join_non_empty(&parts, "");
                         if transcript.is_empty() {
                             let mut m = fin_core.meeting.lock().unwrap();
                             if m.gen == my_gen {
                                 m.transcribing = false;
                                 m.started = None;
-                                m.status = "No speech was detected in the meeting.".into();
+                                m.status = chunk_warning.unwrap_or_else(|| {
+                                    "No speech was detected in the meeting.".into()
+                                });
+                            }
+                            drop(m);
+                            if !fin_core.preview {
+                                crate::meeting::clear_draft();
                             }
                             fin_core.repaint();
                             return;
                         }
+
+                        // Persist raw transcript note to disk OUTSIDE `core.meeting` lock BEFORE
+                        // summarization so canceling or crashing during map-reduce keeps the transcript.
+                        let (now_ts, now_unix) = storage::now_stamp();
+                        let ts = if draft_ts.trim().is_empty() {
+                            now_ts
+                        } else {
+                            draft_ts
+                        };
+                        let base_id = draft_id.max(now_unix);
+                        let fallback_title = format!("Meeting — {ts}");
+                        let mut saved_note_id = 0u64;
+                        let preview = fin_core.preview;
+                        let initial_save = persist_meeting_notes_for_gen(
+                            &fin_core,
+                            my_gen,
+                            |notes| {
+                                let max_existing = notes.iter().map(|n| n.id).max().unwrap_or(0);
+                                let id = base_id.max(max_existing.saturating_add(1));
+                                saved_note_id = id;
+                                notes.insert(
+                                    0,
+                                    crate::meeting::MeetingNote {
+                                        id,
+                                        ts: ts.clone(),
+                                        title: fallback_title.clone(),
+                                        duration_secs,
+                                        loopback_used,
+                                        transcript: transcript.clone(),
+                                        summary: chunk_warning.clone().unwrap_or_default(),
+                                        action_items: Vec::new(),
+                                    },
+                                );
+                                true
+                            },
+                            |candidate| {
+                                if preview {
+                                    Ok(())
+                                } else {
+                                    crate::meeting::save_meetings(candidate)
+                                }
+                            },
+                        );
+                        match initial_save {
+                            Ok(true) => {
+                                if !fin_core.preview {
+                                    crate::meeting::clear_draft();
+                                }
+                            }
+                            Ok(false) => return,
+                            Err(err) => {
+                                if !fin_core.preview {
+                                    let _ = crate::meeting::save_draft(&crate::meeting::MeetingDraft {
+                                        id: base_id,
+                                        ts: ts.clone(),
+                                        loopback_used,
+                                        duration_secs,
+                                        parts,
+                                    });
+                                }
+                                let mut m = fin_core.meeting.lock().unwrap();
+                                if m.gen == my_gen {
+                                    m.transcribing = false;
+                                    m.started = None;
+                                    m.status = format!("Couldn't save meeting note to disk: {err}");
+                                }
+                                drop(m);
+                                fin_core.repaint();
+                                return;
+                            }
+                        }
+
                         {
                             let mut m = fin_core.meeting.lock().unwrap();
                             if m.gen != my_gen {
@@ -1289,69 +1792,219 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                             m.status = "Summarizing meeting…".into();
                         }
                         fin_core.repaint();
-                        let (ts, unix) = storage::now_stamp();
-                        let (title, summary, action_items, done_status) =
-                            match cleanup::summarize_meeting(&s, &transcript) {
-                                Ok((t, sum, items)) => {
-                                    let title = if t.trim().is_empty() {
-                                        format!("Meeting — {ts}")
-                                    } else {
-                                        t
-                                    };
-                                    (title, sum, items, "Meeting note saved.".to_owned())
-                                }
-                                Err(_) => (
-                                    format!("Meeting — {ts}"),
-                                    String::new(),
-                                    Vec::new(),
-                                    "Meeting saved (raw transcript — Ollama unavailable).".to_owned(),
-                                ),
-                            };
-                        let mut m = fin_core.meeting.lock().unwrap();
-                        if m.gen != my_gen {
-                            return;
-                        }
-                        let max_existing = m.notes.iter().map(|n| n.id).max().unwrap_or(0);
-                        let id = unix.max(max_existing.saturating_add(1));
-                        m.notes.insert(
-                            0,
-                            crate::meeting::MeetingNote {
-                                id,
-                                ts,
-                                title,
-                                duration_secs,
-                                loopback_used,
-                                transcript,
-                                summary,
-                                action_items,
-                            },
+
+                        let cancel_core = fin_core.clone();
+                        let summary_res = cleanup::summarize_meeting_cancellable(
+                            &s,
+                            &transcript,
+                            move || cancel_core.meeting.lock().unwrap().gen != my_gen,
                         );
-                        m.notes.truncate(crate::meeting::MAX_MEETINGS);
-                        if !fin_core.preview {
-                            let _ = crate::meeting::save_meetings(&m.notes);
+                        match summary_res {
+                            Ok((t, sum, items)) => {
+                                let final_title = if t.trim().is_empty() {
+                                    fallback_title
+                                } else {
+                                    t
+                                };
+                                let (final_summary, done_status) = match &chunk_warning {
+                                    Some(warn) => {
+                                        let combined_sum = if sum.trim().is_empty() {
+                                            warn.clone()
+                                        } else {
+                                            format!("{}\n\n{warn}", sum.trim())
+                                        };
+                                        (combined_sum, format!("Meeting note saved. {warn}"))
+                                    }
+                                    None => (sum, "Meeting note saved.".to_owned()),
+                                };
+                                let mut found = false;
+                                let update_save = persist_meeting_notes_for_gen(
+                                    &fin_core,
+                                    my_gen,
+                                    |notes| {
+                                        let Some(note) =
+                                            notes.iter_mut().find(|n| n.id == saved_note_id)
+                                        else {
+                                            found = false;
+                                            return false;
+                                        };
+                                        found = true;
+                                        note.title = final_title.clone();
+                                        note.summary = final_summary.clone();
+                                        note.action_items = items.clone();
+                                        true
+                                    },
+                                    |candidate| {
+                                        if preview {
+                                            Ok(())
+                                        } else {
+                                            crate::meeting::save_meetings(candidate)
+                                        }
+                                    },
+                                );
+                                let mut m = fin_core.meeting.lock().unwrap();
+                                if m.gen != my_gen {
+                                    return;
+                                }
+                                m.transcribing = false;
+                                m.started = None;
+                                match update_save {
+                                    Ok(true) => m.status = done_status,
+                                    Ok(false) if !found => {
+                                        m.status = "Meeting note was deleted before summarization finished.".into();
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        m.status = format!(
+                                            "Meeting transcript saved, but couldn't save summary to disk: {err}"
+                                        );
+                                    }
+                                }
+                                drop(m);
+                                fin_core.repaint();
+                            }
+                            Err(err) => {
+                                let mut m = fin_core.meeting.lock().unwrap();
+                                if m.gen != my_gen {
+                                    return;
+                                }
+                                m.transcribing = false;
+                                m.started = None;
+                                m.status = match chunk_warning {
+                                    Some(warn) => {
+                                        format!("Meeting saved (raw transcript — {err}) {warn}")
+                                    }
+                                    None => format!("Meeting saved (raw transcript — {err})"),
+                                };
+                                drop(m);
+                                fin_core.repaint();
+                            }
                         }
-                        m.transcribing = false;
-                        m.started = None;
-                        m.status = done_status;
-                        drop(m);
-                        fin_core.repaint();
+                    });
+            }
+            Cmd::ResummarizeMeeting { id, reply } => {
+                if core.benchmark_active.load(Ordering::Acquire) {
+                    let _ = reply.send(Err("Finish the speech benchmark before re-summarizing a meeting.".into()));
+                    continue;
+                }
+                if core.phase() != Phase::Idle {
+                    let _ = reply.send(Err("Finish the current dictation before re-summarizing a meeting.".into()));
+                    continue;
+                }
+                let prep = {
+                    let mut m = core.meeting.lock().unwrap();
+                    if m.active || m.transcribing {
+                        Err("A meeting recording or summarization is already in progress.".to_owned())
+                    } else if let Some(note) = m.notes.iter().find(|n| n.id == id) {
+                        if note.transcript.trim().is_empty() {
+                            Err("Meeting transcript is empty.".to_owned())
+                        } else {
+                            let transcript = note.transcript.clone();
+                            let orig_ts = note.ts.clone();
+                            m.gen = m.gen.wrapping_add(1);
+                            let my_gen = m.gen;
+                            m.transcribing = true;
+                            m.status = "Re-summarizing meeting…".into();
+                            Ok((my_gen, transcript, orig_ts))
+                        }
+                    } else {
+                        Err("Meeting note not found.".to_owned())
+                    }
+                };
+                let (my_gen, transcript, orig_ts) = match prep {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        let _ = reply.send(Err(msg));
+                        continue;
+                    }
+                };
+                core.repaint();
+                let _ = reply.send(Ok(()));
+
+                let fin_core = core.clone();
+                let _ = std::thread::Builder::new()
+                    .name("meeting-resummarize".into())
+                    .spawn(move || {
+                        let s = fin_core.settings();
+                        let cancel_core = fin_core.clone();
+                        let summary_res = cleanup::summarize_meeting_cancellable(
+                            &s,
+                            &transcript,
+                            move || cancel_core.meeting.lock().unwrap().gen != my_gen,
+                        );
+                        match summary_res {
+                            Ok((t, sum, items)) => {
+                                let preview = fin_core.preview;
+                                let mut found = false;
+                                let update_save = persist_meeting_notes_for_gen(
+                                    &fin_core,
+                                    my_gen,
+                                    |notes| {
+                                        let Some(note) = notes.iter_mut().find(|n| n.id == id) else {
+                                            found = false;
+                                            return false;
+                                        };
+                                        found = true;
+                                        if !t.trim().is_empty() {
+                                            note.title = t.clone();
+                                        } else if note.title.trim().is_empty() {
+                                            note.title = format!("Meeting — {orig_ts}");
+                                        }
+                                        note.summary = sum.clone();
+                                        note.action_items = items.clone();
+                                        true
+                                    },
+                                    |candidate| {
+                                        if preview {
+                                            Ok(())
+                                        } else {
+                                            crate::meeting::save_meetings(candidate)
+                                        }
+                                    },
+                                );
+                                let mut m = fin_core.meeting.lock().unwrap();
+                                if m.gen != my_gen {
+                                    return;
+                                }
+                                m.transcribing = false;
+                                match update_save {
+                                    Ok(true) => m.status = "Meeting summary updated.".into(),
+                                    Ok(false) if !found => {
+                                        m.status = "Meeting note was deleted before re-summarization finished.".into();
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        m.status = format!(
+                                            "Summary generated, but couldn't save to disk: {err}"
+                                        );
+                                    }
+                                }
+                                drop(m);
+                                fin_core.repaint();
+                            }
+                            Err(err) => {
+                                let mut m = fin_core.meeting.lock().unwrap();
+                                if m.gen != my_gen {
+                                    return;
+                                }
+                                m.transcribing = false;
+                                m.status = err;
+                                drop(m);
+                                fin_core.repaint();
+                            }
+                        }
                     });
             }
             Cmd::CancelMeeting => {
-                {
-                    let mut m = core.meeting.lock().unwrap();
-                    m.gen = m.gen.wrapping_add(1);
-                    m.active = false;
-                    m.transcribing = false;
-                    m.started = None;
-                    m.elapsed_secs = 0;
-                    m.loopback_active = false;
-                    m.loopback_warning = None;
-                    m.status = "Meeting recording discarded.".into();
-                }
+                let (was_active, was_transcribing) = core.apply_cancel_meeting_state();
                 meeting_recorder.lock().unwrap().cancel();
                 let _ = meeting_drain_handle.take();
-                core.cue(Cue::Cancel);
+                if !core.preview {
+                    crate::meeting::clear_draft();
+                }
+                if was_active || was_transcribing {
+                    core.cue(Cue::Cancel);
+                }
                 core.repaint();
             }
             Cmd::Lab { action, text, instruction } => {
@@ -1398,6 +2051,10 @@ fn controller(core: Arc<Core>, rx: Receiver<Cmd>) {
                 core.draft_delivery_pending.store(false, Ordering::Release);
             }
             Cmd::ReloadEngine => {
+                if !core.can_reload_engine() {
+                    core.set_status("Cannot reload the speech engine while a meeting or benchmark is active.");
+                    continue;
+                }
                 let c = core.clone();
                 std::thread::spawn(move || load_engine(&c));
             }
@@ -2924,5 +3581,222 @@ mod offline_flow {
                 "discarded dictation must not emit History, ToWorkspace, or Retained events"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_note(id: u64, title: &str) -> crate::meeting::MeetingNote {
+        crate::meeting::MeetingNote {
+            id,
+            ts: "2026-11-25 11:00".into(),
+            title: title.into(),
+            duration_secs: 90,
+            loopback_used: true,
+            transcript: "Alice: Ship Friday.".into(),
+            summary: "Team agreed to ship Friday.".into(),
+            action_items: vec!["Alice to tag release".into()],
+        }
+    }
+
+    #[test]
+    fn delete_meeting_rolls_back_on_save_failure() {
+        let (core, _) = Core::new(Settings::default(), true);
+        {
+            let mut m = core.meeting.lock().unwrap();
+            m.notes = vec![sample_note(10, "Standup"), sample_note(20, "Retro")];
+            m.notes_ver = 3;
+        }
+
+        let deleted = core.delete_meeting_with_saver(10, |candidate| {
+            assert!(
+                core.meeting.try_lock().is_ok(),
+                "core.meeting lock must not be held during disk save"
+            );
+            assert_eq!(candidate.len(), 1);
+            assert_eq!(candidate[0].id, 20);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "disk full",
+            ))
+        });
+        assert!(!deleted, "save failure must return false");
+        {
+            let m = core.meeting.lock().unwrap();
+            let ids: Vec<u64> = m.notes.iter().map(|n| n.id).collect();
+            assert_eq!(ids, vec![10, 20], "notes must remain unchanged on save failure");
+            assert_eq!(m.notes_ver, 3, "notes_ver must not bump on save failure");
+            assert!(
+                m.status.contains("disk full"),
+                "disk error should be surfaced in status, got: {}",
+                m.status
+            );
+        }
+
+        let deleted_ok = core.delete_meeting_with_saver(10, |candidate| {
+            assert!(core.meeting.try_lock().is_ok());
+            assert_eq!(candidate.len(), 1);
+            assert_eq!(candidate[0].id, 20);
+            Ok(())
+        });
+        assert!(deleted_ok, "successful save must commit delete");
+        {
+            let m = core.meeting.lock().unwrap();
+            let ids: Vec<u64> = m.notes.iter().map(|n| n.id).collect();
+            assert_eq!(ids, vec![20]);
+            assert_eq!(m.notes_ver, 4);
+        }
+
+        let missing = core.delete_meeting_with_saver(999, |_| {
+            panic!("missing meeting id must not invoke saver")
+        });
+        assert!(!missing);
+        assert_eq!(core.meeting.lock().unwrap().notes_ver, 4);
+    }
+
+    #[test]
+    fn chunk_transcription_errors_are_surfaced() {
+        let loud = vec![0.2f32; speech::SAMPLE_RATE];
+        let silent = vec![0.0f32; speech::SAMPLE_RATE];
+        let chunks: Vec<&[f32]> = vec![&loud, &silent, &loud, &loud];
+
+        let mut call_idx = 0usize;
+        let res = transcribe_meeting_chunks_with(
+            &chunks,
+            || false,
+            |_chunk| {
+                call_idx += 1;
+                match call_idx {
+                    1 => Ok("First part.".into()),
+                    2 => Err("whisper decoder failed".into()),
+                    3 => Ok("Third part.".into()),
+                    _ => unreachable!(),
+                }
+            },
+        );
+        assert_eq!(res.parts, vec!["First part.", "Third part."]);
+        assert_eq!(res.failed_chunks, 1);
+        assert_eq!(res.last_error.as_deref(), Some("whisper decoder failed"));
+
+        let warning = meeting_chunk_error_warning(res.failed_chunks, res.last_error.as_deref())
+            .expect("failed chunks must produce a user-facing warning");
+        assert!(warning.contains("1 audio chunk"), "unexpected warning: {warning}");
+        assert!(
+            warning.contains("whisper decoder failed"),
+            "warning must include error detail: {warning}"
+        );
+        assert_eq!(meeting_chunk_error_warning(0, None), None);
+
+        // Cancellation stops before processing subsequent chunks.
+        let cancel_calls = std::cell::Cell::new(0usize);
+        let cancelled = transcribe_meeting_chunks_with(
+            &chunks,
+            || cancel_calls.get() >= 1,
+            |_chunk| {
+                cancel_calls.set(cancel_calls.get() + 1);
+                Ok("Only first.".into())
+            },
+        );
+        assert_eq!(cancel_calls.get(), 1);
+        assert!(cancelled.parts.is_empty(), "cancelled chunk must not be committed");
+    }
+
+    #[test]
+    fn meeting_typed_snapshot_skips_notes_when_version_matches() {
+        let (core, _) = Core::new(Settings::default(), true);
+        let initial = core.meeting_typed_snapshot(None);
+        assert_eq!(initial.notes_ver, 0);
+        assert!(initial.notes.is_some());
+        assert_eq!(initial.notes.as_ref().unwrap().len(), 1);
+
+        let unchanged = core.meeting_typed_snapshot(Some(initial.notes_ver));
+        assert_eq!(unchanged.notes_ver, initial.notes_ver);
+        assert!(
+            unchanged.notes.is_none(),
+            "known_notes_ver == Some(notes_ver) must skip cloning notes"
+        );
+
+        assert!(core.delete_meeting(1));
+        let updated = core.meeting_typed_snapshot(Some(initial.notes_ver));
+        assert_eq!(updated.notes_ver, initial.notes_ver + 1);
+        assert_eq!(updated.notes, Some(Vec::new()));
+
+        let cached_again = core.meeting_typed_snapshot(Some(updated.notes_ver));
+        assert!(cached_again.notes.is_none());
+    }
+
+    #[test]
+    fn cancel_meeting_during_transcribing_bumps_gen_and_keeps_notes() {
+        let (core, _) = Core::new(Settings::default(), true);
+        let (old_gen, old_notes) = {
+            let mut m = core.meeting.lock().unwrap();
+            m.active = false;
+            m.transcribing = true;
+            m.status = "Summarizing meeting…".into();
+            (m.gen, m.notes.clone())
+        };
+        assert!(core.meeting_active());
+
+        core.cancel_meeting();
+
+        let m = core.meeting.lock().unwrap();
+        assert_ne!(m.gen, old_gen, "cancel_meeting must bump gen");
+        assert!(!m.transcribing, "cancel_meeting must clear transcribing");
+        assert!(!m.active);
+        assert_eq!(m.status, "Summarization canceled.");
+        assert_eq!(m.notes, old_notes, "already-saved notes must be preserved");
+    }
+
+    #[test]
+    fn draft_recovery_commits_only_on_save_success_and_guards_benchmark_reload() {
+        let mut notes = vec![sample_note(5, "Existing")];
+        let draft = crate::meeting::MeetingDraft {
+            id: 5,
+            ts: "2026-11-25 12:30".into(),
+            loopback_used: true,
+            duration_secs: 42,
+            parts: vec!["Recovered line one.".into(), "Recovered line two.".into()],
+        };
+
+        let mut cleared = false;
+        let err_msg = recover_meeting_draft_into(
+            &mut notes,
+            Some(draft.clone()),
+            |_| Err(std::io::Error::new(std::io::ErrorKind::Other, "io error")),
+            || cleared = true,
+        );
+        assert!(err_msg.unwrap().contains("io error"));
+        assert!(!cleared, "draft must not be cleared when save_meetings fails");
+        assert_eq!(notes.len(), 1);
+
+        let ok_msg = recover_meeting_draft_into(
+            &mut notes,
+            Some(draft),
+            |saved| {
+                assert_eq!(saved.len(), 2);
+                assert_eq!(saved[0].id, 6);
+                assert_eq!(saved[0].transcript, "Recovered line one. Recovered line two.");
+                Ok(())
+            },
+            || cleared = true,
+        );
+        assert!(ok_msg.is_some());
+        assert!(cleared, "draft must be cleared after save_meetings succeeds");
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].id, 6);
+
+        // Reload guard and benchmark_active exclusion.
+        let (core, _) = Core::new(Settings::default(), true);
+        assert!(core.can_reload_engine());
+        core.benchmark_active.store(true, Ordering::Release);
+        assert!(!core.can_reload_engine());
+        assert!(core.start_meeting_with_loopback(true).is_err());
+        assert!(core.resummarize_meeting(1).is_err());
+        core.benchmark_active.store(false, Ordering::Release);
+        assert!(core.can_reload_engine());
+        core.meeting.lock().unwrap().transcribing = true;
+        assert!(!core.can_reload_engine());
     }
 }
