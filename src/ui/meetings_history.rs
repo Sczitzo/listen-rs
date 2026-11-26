@@ -448,13 +448,16 @@ pub fn render_history(
 
         if show_side_rail {
             let list_w = (avail_w - rail_w - gap).max(320.0);
+            let rail_scroll_h = jump_rail_scroll_height(groups.len(), ui.ctx().screen_rect().height());
+            let rail_alloc_h = rail_scroll_h + 64.0;
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                // Left "Jump to" timeline rail
-                ui.allocate_ui_with_layout(vec2(rail_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                // Left "Jump to" timeline rail — pass explicit vertical room so the inner
+                // ScrollArea does not collapse to egui's 64px minimum height.
+                ui.allocate_ui_with_layout(vec2(rail_w, rail_alloc_h), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(rail_w);
                     ui.set_max_width(rail_w);
-                    render_jump_rail(ui, p, &groups, &group_starts, &icon_map, state, rail_w);
+                    render_jump_rail(ui, p, &groups, &group_starts, &icon_map, state, rail_w, rail_scroll_h);
                 });
                 // Right history entries column
                 ui.allocate_ui_with_layout(vec2(list_w, 0.0), Layout::top_down(Align::Min), |ui| {
@@ -521,6 +524,15 @@ pub fn render_history(
     });
 }
 
+const JUMP_RAIL_ROW_STEP: f32 = 28.0;
+
+fn jump_rail_scroll_height(group_count: usize, screen_height: f32) -> f32 {
+    let content_h = (group_count as f32) * JUMP_RAIL_ROW_STEP + 4.0;
+    let max_h = (screen_height * 0.56).clamp(320.0, 480.0);
+    content_h.min(max_h).max(JUMP_RAIL_ROW_STEP)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_jump_rail(
     ui: &mut Ui,
     p: &Palette,
@@ -529,7 +541,10 @@ fn render_jump_rail(
     icon_map: &std::collections::HashMap<String, &str>,
     state: &mut HistoryUiState,
     rail_w: f32,
+    scroll_h: f32,
 ) {
+    let content_h = (groups.len() as f32) * JUMP_RAIL_ROW_STEP + 4.0;
+    let scrollable = content_h > scroll_h + 1.0;
     Frame::default()
         .fill(p.surface)
         .stroke(Stroke::new(1.0_f32, p.line))
@@ -540,18 +555,25 @@ fn render_jump_rail(
             ui.set_width(inner_w);
             ui.set_max_width(inner_w);
             let title = match state.grouping {
-                HistoryGrouping::Day => "JUMP TO DATE",
-                HistoryGrouping::App => "JUMP TO APP",
+                HistoryGrouping::Day => format!("JUMP TO DATE · {}", groups.len()),
+                HistoryGrouping::App => format!("JUMP TO APP · {}", groups.len()),
             };
             ui.label(RichText::new(title).size(10.5).strong().color(p.faint));
             ui.add_space(6.0);
 
             ScrollArea::vertical()
                 .id_salt("history_jump_rail_scroll")
-                .max_height(460.0)
-                .auto_shrink([false, true])
+                .min_scrolled_height(scroll_h)
+                .max_height(scroll_h)
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(if scrollable {
+                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+                } else {
+                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+                })
                 .show(ui, |ui| {
-                    let row_w = (ui.available_width() - 4.0).max(80.0);
+                    let sb_gutter = if scrollable { 12.0 } else { 2.0 };
+                    let row_w = (ui.available_width() - sb_gutter).max(80.0);
                     for (idx, (key, entries)) in groups.iter().enumerate() {
                         let active = state.selected_group.as_deref() == Some(*key);
                         let short_lbl = match state.grouping {
@@ -1581,5 +1603,15 @@ mod tests {
             resummarize_label("Team noted the summary unavailable issue was fixed."),
             "Re-summarize"
         );
+    }
+
+    #[test]
+    fn jump_rail_height_expands_for_many_days_instead_of_collapsing_to_two_rows() {
+        // 64 days on a 720px window must get ~403px (showing ~14 days + scrollbar), never 64px.
+        let many = jump_rail_scroll_height(64, 720.0);
+        assert!(many >= 380.0 && many <= 480.0, "expected tall rail for 64 days, got {many}");
+        // 2 days stays compact without excess blank space.
+        let few = jump_rail_scroll_height(2, 720.0);
+        assert!((few - 60.0).abs() < 1.0, "expected compact ~60px rail for 2 days, got {few}");
     }
 }
