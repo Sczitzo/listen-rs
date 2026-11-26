@@ -251,6 +251,7 @@ impl ListenApp {
                     outcome: "paste confirmed".into(),
                     app_name: "VS Code".into(),
                     app_icon: None,
+                    ..Default::default()
                 },
                 HistoryEntry {
                     when,
@@ -263,6 +264,7 @@ impl ListenApp {
                     outcome: "paste confirmed".into(),
                     app_name: "Discord".into(),
                     app_icon: None,
+                    ..Default::default()
                 },
             ]
         } else {
@@ -814,23 +816,34 @@ impl ListenApp {
                 }
                 UiAction::FinishDictation => self.core.send(Cmd::Finish),
                 UiAction::CancelDictation => self.core.send(Cmd::Cancel),
-                UiAction::UpdateVocab(v) => {
-                    self.vocab_buf = v.clone();
-                    self.settings.vocab = v;
-                }
-                UiAction::AcceptVocabSuggestion(word) => {
-                    let mut parts = storage::vocab_words(&self.settings.vocab);
-                    if !parts.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
-                        parts.push(word.clone());
-                        self.settings.vocab = parts.join(", ");
+                UiAction::UpdateVocab(v) => match crate::settings_bridge::sanitize_vocab(&v) {
+                    Ok(clean) => {
+                        self.vocab_buf = clean.clone();
+                        self.settings.vocab = clean;
+                    }
+                    Err(msg) => {
                         self.vocab_buf = self.settings.vocab.clone();
-                        self.toast(format!("Added “{word}” to vocabulary"));
+                        self.toast(msg);
+                    }
+                },
+                UiAction::AcceptVocabSuggestion(word) => {
+                    match crate::settings_bridge::add_vocab_word(&mut self.settings, &word) {
+                        Ok(true) => {
+                            self.vocab_buf = self.settings.vocab.clone();
+                            self.toast(format!("Added “{}” to vocabulary", word.trim()));
+                        }
+                        Ok(false) => {}
+                        Err(msg) => self.toast(msg),
                     }
                 }
                 UiAction::DismissVocabSuggestion(word) => {
-                    if !self.settings.vocab_dismissed.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
-                        self.settings.vocab_dismissed.push(word);
+                    if let Err(msg) = crate::settings_bridge::dismiss_vocab_word(&mut self.settings, &word) {
+                        self.toast(msg);
                     }
+                }
+                UiAction::ClearDismissedVocab => {
+                    self.settings.vocab_dismissed.clear();
+                    self.toast("Cleared dismissed vocabulary suggestions");
                 }
 
                 // Prompt Lab
@@ -1041,7 +1054,10 @@ impl ListenApp {
                         self.toast("Finish the current recording before clearing History.");
                     } else {
                         if !self.preview() {
-                            storage::clear_history();
+                            if let Err(e) = storage::clear_history() {
+                                self.toast(format!("Could not clear history: {e}"));
+                                continue;
+                            }
                         }
                         self.history.clear();
                         self.history_ui.confirm_clear = false;
@@ -1136,18 +1152,12 @@ impl ListenApp {
                     }
                 }
                 UiAction::AddSnippet { trigger, expansion } => {
-                    match crate::snippets::validate_snippet(&trigger, &expansion) {
-                        Ok(snip) => {
-                            if let Some(existing) = self
-                                .settings
-                                .snippets
-                                .iter_mut()
-                                .find(|s| s.trigger.eq_ignore_ascii_case(&snip.trigger))
-                            {
-                                *existing = snip;
-                            } else {
-                                self.settings.snippets.push(snip);
-                            }
+                    match crate::settings_bridge::upsert_snippet(
+                        &mut self.settings.snippets,
+                        &trigger,
+                        &expansion,
+                    ) {
+                        Ok(()) => {
                             self.settings_ui.snippet_trigger.clear();
                             self.settings_ui.snippet_expansion.clear();
                             self.settings_ui.snippet_error = None;

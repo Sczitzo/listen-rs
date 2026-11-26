@@ -281,7 +281,7 @@ fn render_hero_details(
                 let hk = view.hotkey_display;
                 ui.label(
                     RichText::new(format!(
-                        "Hold {hk} to dictate and release to finish, or tap {hk} once for hands-free recording and tap again when done. Press Esc at any time to cancel and discard. Begin with \"Hey, prompt engineer this\" followed by your request to turn spoken ideas directly into an engineered prompt."
+                        "Hold {hk} to dictate and release to finish, or tap {hk} once for hands-free recording and tap again when done. Press Esc at any time to cancel and discard. Say \"scratch that\" to undo the last phrase, \"new paragraph\" for a paragraph break, or set up Voice Snippets in Settings to expand spoken shortcuts."
                     ))
                     .size(12.5)
                     .line_height(Some(19.0))
@@ -389,10 +389,7 @@ fn render_vocabulary_card(
             actions.push(UiAction::UpdateVocab(vocab_buf.clone()));
         }
 
-        let term_count = vocab_buf
-            .split([',', '\n'])
-            .filter(|w| !w.trim().is_empty())
-            .count();
+        let term_count = crate::storage::vocab_words(vocab_buf).len();
         if term_count > 0 {
             ui.add_space(4.0);
             let count_note = match term_count {
@@ -411,6 +408,19 @@ fn render_vocabulary_card(
             );
             ui.add_space(6.0);
             render_vocab_chips(ui, p, view.vocab_suggestions, actions);
+        }
+
+        if !view.settings.vocab_dismissed.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if widgets::ghost_btn(ui, p, "Reset dismissed", true)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Restore previously dismissed vocabulary suggestions")
+                    .clicked()
+                {
+                    actions.push(UiAction::ClearDismissedVocab);
+                }
+            });
         }
     });
 }

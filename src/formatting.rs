@@ -33,6 +33,19 @@ static PREAMBLE: LazyLock<Regex> = LazyLock::new(|| {
 ).unwrap()
 });
 static BACKTICKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`+").unwrap());
+static URL_SPAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>"'`)\]]+"#).unwrap());
+static FENCED_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```.*?```").unwrap());
+static NEWLINE_CMD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?P<pre>[ \t,]*)\b(?P<cmd>new\s+(?:paragraph|line))\b(?P<post>[ \t,.]*)")
+        .unwrap()
+});
+static SCRATCH_CMD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?P<sep>(?:\s*[,;—]\s*|\s+--?\s+|\s*\.\s+|\s+))(?P<cmd>scratch\s+that|delete\s+that)\b(?P<after>[ \t]*[,.;!?]?[ \t]*)",
+    )
+    .unwrap()
+});
 
 fn words(text: &str) -> Vec<String> {
     WORD.find_iter(text)
@@ -44,17 +57,93 @@ fn tokens<'a>(pattern: &'static Regex, text: &'a str) -> impl Iterator<Item = &'
     pattern.find_iter(text).map(|m| m.as_str())
 }
 
+fn technical_literal_matches(text: &str) -> Vec<(usize, usize, &str)> {
+    TECHNICAL
+        .find_iter(text)
+        .filter_map(|m| {
+            let value = m.as_str();
+            let previous = text[..m.start()].chars().next_back();
+            let preceded_by_word = previous.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let flag = value.starts_with("--") && !value.contains(['/', '\\']);
+            if preceded_by_word || (flag && previous == Some('-')) {
+                return None;
+            }
+            let trimmed = value.trim_end_matches(['.', ',']);
+            Some((m.start(), m.start() + trimmed.len(), trimmed))
+        })
+        .collect()
+}
+
 fn technical_literals(text: &str) -> impl Iterator<Item = &str> {
-    TECHNICAL.find_iter(text).filter_map(|m| {
-        let value = m.as_str();
-        let previous = text[..m.start()].chars().next_back();
-        let preceded_by_word = previous.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let flag = value.starts_with("--") && !value.contains(['/', '\\']);
-        if preceded_by_word || (flag && previous == Some('-')) {
-            return None;
+    technical_literal_matches(text)
+        .into_iter()
+        .map(|(_, _, value)| value)
+}
+
+fn inline_code_ranges(text: &str) -> Vec<(usize, usize)> {
+    let runs: Vec<_> = BACKTICKS.find_iter(text).collect();
+    let mut ranges = Vec::new();
+    let mut position = 0;
+    while let Some(open) = runs.get(position) {
+        if let Some((end, close)) = runs
+            .iter()
+            .enumerate()
+            .skip(position + 1)
+            .take_while(|(_, close)| !text[open.end()..close.start()].contains('\n'))
+            .find(|(_, close)| close.len() == open.len())
+        {
+            ranges.push((open.end(), close.start()));
+            position = end + 1;
+        } else {
+            position += 1;
         }
-        Some(value.trim_end_matches(['.', ',']))
+    }
+    ranges
+}
+
+fn inline_code_full_ranges(text: &str) -> Vec<(usize, usize)> {
+    let runs: Vec<_> = BACKTICKS.find_iter(text).collect();
+    let mut ranges = Vec::new();
+    let mut position = 0;
+    while let Some(open) = runs.get(position) {
+        if let Some((end, close)) = runs
+            .iter()
+            .enumerate()
+            .skip(position + 1)
+            .take_while(|(_, close)| !text[open.end()..close.start()].contains('\n'))
+            .find(|(_, close)| close.len() == open.len())
+        {
+            ranges.push((open.start(), close.end()));
+            position = end + 1;
+        } else {
+            position += 1;
+        }
+    }
+    ranges
+}
+
+fn technical_literals_match(raw: &str, formatted: &str) -> bool {
+    let raw_lits = technical_literal_matches(raw);
+    let fmt_lits = technical_literal_matches(formatted);
+    if raw_lits.len() != fmt_lits.len() {
+        return false;
+    }
+    if raw_lits.is_empty() {
+        return true;
+    }
+    let code_ranges = inline_code_ranges(formatted);
+    raw_lits.into_iter().zip(fmt_lits).all(|((_, _, r), (fs, fe, f))| {
+        r == f
+            || (r.to_lowercase() == f.to_lowercase()
+                && code_ranges.iter().any(|&(cs, ce)| fs >= cs && fe <= ce))
     })
+}
+
+fn is_negative_word(word: &str) -> bool {
+    matches!(
+        word,
+        "no" | "not" | "never" | "neither" | "nor" | "without" | "cannot"
+    ) || word.ends_with("n't")
 }
 
 fn filler(word: &str) -> bool {
@@ -94,27 +183,22 @@ fn same_words(raw: &str, cleaned: &str, vocabulary: &str) -> bool {
         return false;
     }
     if !tokens(&NUMBER, raw).eq(tokens(&NUMBER, cleaned))
-        || !technical_literals(raw).eq(technical_literals(cleaned))
+        || !technical_literals_match(raw, cleaned)
         || (PREAMBLE.is_match(cleaned.trim()) && !PREAMBLE.is_match(raw.trim()))
     {
         return false;
     }
-    let negative = |word: &&str| {
-        matches!(
-            *word,
-            "no" | "not" | "never" | "neither" | "nor" | "without" | "cannot"
-        ) || word.ends_with("n't")
-    };
     if !before
         .iter()
         .map(String::as_str)
-        .filter(negative)
-        .eq(after.iter().map(String::as_str).filter(negative))
+        .filter(|w| is_negative_word(w))
+        .eq(after.iter().map(String::as_str).filter(|w| is_negative_word(w)))
     {
         return false;
     }
+    let vocab_entries = crate::storage::vocab_words(vocabulary);
     let names = tokens(&NAME, raw).filter(|name| !NAMED_FILLER.is_match(name));
-    for term in names.chain(vocabulary.split([',', '\n', ';'])) {
+    for term in names.chain(vocab_entries.iter().map(String::as_str)) {
         let terms = words(term);
         let count =
             |in_words: &[String], word: &str| in_words.iter().filter(|v| *v == word).count();
@@ -309,9 +393,672 @@ fn strip_lists(lines: &mut [String]) {
     }
 }
 
-pub fn is_safe(raw: &str, formatted: &str, vocabulary: &str) -> bool {
+fn has_whole_word_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let matched = &text[start..end];
+    let Some(first) = matched.chars().next() else {
+        return false;
+    };
+    let Some(last) = matched.chars().next_back() else {
+        return false;
+    };
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    if let Some(prev) = text[..start].chars().next_back() {
+        if is_word(first) {
+            if is_word(prev) {
+                return false;
+            }
+        } else if is_word(prev) || prev == first {
+            return false;
+        }
+    }
+    if let Some(next) = text[end..].chars().next() {
+        if is_word(last) {
+            if is_word(next) {
+                return false;
+            }
+        } else if is_word(next) || next == last {
+            return false;
+        }
+    }
+    true
+}
+
+fn split_structured_vocab(term: &str) -> Option<Vec<String>> {
+    let alnum_count = term.chars().filter(|c| c.is_alphanumeric()).count();
+    if alnum_count < 4 {
+        return None;
+    }
+    let chars: Vec<char> = term.chars().collect();
+    let mut has_structure = term.contains(['.', '-', '_']);
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if matches!(c, '.' | '-' | '_') || c.is_whitespace() {
+            if !cur.is_empty() {
+                parts.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if !cur.is_empty() {
+            let prev = chars[i - 1];
+            let next = chars.get(i + 1).copied();
+            let is_camel = (prev.is_lowercase() && c.is_uppercase())
+                || (prev.is_uppercase()
+                    && c.is_uppercase()
+                    && next.is_some_and(char::is_lowercase));
+            if is_camel {
+                has_structure = true;
+                parts.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    (has_structure && parts.len() >= 2).then_some(parts)
+}
+
+fn build_exact_vocab_pattern(term: &str) -> String {
+    let pieces: Vec<String> = term.split_whitespace().map(regex::escape).collect();
+    format!("(?i){}", pieces.join(r"[ \t]+"))
+}
+
+fn apply_vocab_postpass(text: &str, vocabulary: &str) -> (String, bool) {
+    if text.is_empty() || text.len() > 2_000_000 || vocabulary.trim().is_empty() {
+        return (text.to_owned(), false);
+    }
+    let raw_entries = crate::storage::vocab_words(vocabulary);
+    if raw_entries.is_empty() {
+        return (text.to_owned(), false);
+    }
+    let mut entries: Vec<String> = Vec::with_capacity(raw_entries.len());
+    let mut seen = std::collections::HashSet::new();
+    for entry in raw_entries {
+        if seen.insert(entry.to_lowercase()) {
+            entries.push(entry);
+        }
+    }
+
+    let mut backtick_ranges = inline_code_full_ranges(text);
+    for m in FENCED_CODE.find_iter(text) {
+        backtick_ranges.push((m.start(), m.end()));
+    }
+    let url_ranges: Vec<(usize, usize)> = URL_SPAN
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+
+    let overlaps = |ranges: &[(usize, usize)], s: usize, e: usize| {
+        ranges.iter().any(|&(rs, re)| s < re && e > rs)
+    };
+
+    // (start, end, replacement, is_exact)
+    let mut candidates: Vec<(usize, usize, &str, bool)> = Vec::new();
+    for term in &entries {
+        let exact_pat = build_exact_vocab_pattern(term);
+        if let Ok(re) = Regex::new(&exact_pat) {
+            for m in re.find_iter(text) {
+                let (s, e) = (m.start(), m.end());
+                if !has_whole_word_boundaries(text, s, e) || overlaps(&backtick_ranges, s, e) {
+                    continue;
+                }
+                if overlaps(&url_ranges, s, e)
+                    && !url_ranges.iter().any(|&(us, ue)| us == s && ue == e)
+                {
+                    continue;
+                }
+                candidates.push((s, e, term.as_str(), true));
+            }
+        }
+        if let Some(parts) = split_structured_vocab(term) {
+            let escaped: Vec<String> = parts.iter().map(|p| regex::escape(p)).collect();
+            let struct_pat = format!("(?i){}", escaped.join(r"[ \t._-]*"));
+            if let Ok(re) = Regex::new(&struct_pat) {
+                for m in re.find_iter(text) {
+                    let (s, e) = (m.start(), m.end());
+                    if !has_whole_word_boundaries(text, s, e)
+                        || overlaps(&backtick_ranges, s, e)
+                        || overlaps(&url_ranges, s, e)
+                    {
+                        continue;
+                    }
+                    candidates.push((s, e, term.as_str(), false));
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return (text.to_owned(), false);
+    }
+
+    // Longest matched span first, then longest configured term, then exact over collapsed, then earliest.
+    candidates.sort_by(|a, b| {
+        (b.1 - b.0)
+            .cmp(&(a.1 - a.0))
+            .then_with(|| b.2.len().cmp(&a.2.len()))
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut chosen: Vec<(usize, usize, &str)> = Vec::new();
+    for (s, e, repl, _) in candidates {
+        if chosen.iter().any(|&(cs, ce, _)| s < ce && e > cs) {
+            continue;
+        }
+        chosen.push((s, e, repl));
+    }
+    chosen.sort_by_key(|&(s, _, _)| s);
+
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    let mut changed = false;
+    for (s, e, repl) in chosen {
+        out.push_str(&text[pos..s]);
+        if &text[s..e] != repl {
+            changed = true;
+        }
+        out.push_str(repl);
+        pos = e;
+    }
+    out.push_str(&text[pos..]);
+    (out, changed)
+}
+
+fn vocab_norm(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '.' | '-' | '_' | '\'' | '’'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn damerau_levenshtein(a: &str, b: &str) -> usize {
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    let n = ac.len();
+    let m = bc.len();
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(ac[i - 1] != bc[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && ac[i - 1] == bc[j - 2] && ac[i - 2] == bc[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[n][m]
+}
+
+fn consonant_skeleton(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        for lc in c.to_lowercase() {
+            if lc.is_alphabetic() && !matches!(lc, 'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'h') {
+                if out.chars().last() != Some(lc) {
+                    out.push(lc);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_vocab_stop_or_modal(w: &str) -> bool {
+    matches!(
+        w,
+        "a" | "an"
+            | "the"
+            | "and"
+            | "or"
+            | "but"
+            | "nor"
+            | "for"
+            | "yet"
+            | "so"
+            | "in"
+            | "on"
+            | "at"
+            | "to"
+            | "of"
+            | "by"
+            | "as"
+            | "is"
+            | "am"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "done"
+            | "can"
+            | "could"
+            | "will"
+            | "would"
+            | "shall"
+            | "should"
+            | "may"
+            | "might"
+            | "must"
+            | "just"
+            | "only"
+            | "also"
+            | "very"
+            | "even"
+            | "still"
+            | "then"
+            | "than"
+            | "that"
+            | "this"
+            | "these"
+            | "those"
+            | "with"
+            | "from"
+            | "into"
+            | "onto"
+            | "over"
+            | "under"
+            | "about"
+            | "after"
+            | "before"
+            | "between"
+            | "through"
+            | "during"
+            | "without"
+            | "because"
+            | "while"
+            | "where"
+            | "when"
+            | "what"
+            | "which"
+            | "who"
+            | "whom"
+            | "whose"
+            | "how"
+            | "why"
+            | "there"
+            | "their"
+            | "they"
+            | "them"
+            | "here"
+            | "your"
+            | "yours"
+            | "our"
+            | "ours"
+            | "mine"
+            | "his"
+            | "her"
+            | "hers"
+            | "him"
+            | "she"
+            | "he"
+            | "it"
+            | "its"
+            | "we"
+            | "us"
+            | "you"
+            | "me"
+            | "my"
+            | "i"
+            | "some"
+            | "any"
+            | "all"
+            | "both"
+            | "each"
+            | "every"
+            | "many"
+            | "much"
+            | "more"
+            | "most"
+            | "other"
+            | "such"
+            | "same"
+            | "well"
+            | "really"
+            | "actually"
+            | "basically"
+            | "literally"
+            | "never"
+            | "ever"
+            | "not"
+            | "no"
+            | "yes"
+            | "yeah"
+            | "okay"
+            | "ok"
+            | "sure"
+            | "please"
+            | "sorry"
+            | "get"
+            | "got"
+            | "put"
+            | "let"
+            | "set"
+            | "run"
+            | "use"
+            | "try"
+            | "see"
+            | "saw"
+            | "say"
+            | "said"
+            | "make"
+            | "made"
+            | "take"
+            | "took"
+            | "give"
+            | "gave"
+            | "come"
+            | "came"
+            | "want"
+            | "need"
+            | "know"
+            | "like"
+            | "good"
+            | "best"
+            | "next"
+            | "last"
+            | "first"
+            | "back"
+            | "down"
+            | "out"
+            | "off"
+            | "now"
+            | "too"
+    )
+}
+
+fn can_reconcile_vocab(raw_span: &str, vocab_term: &str) -> Option<(bool, usize)> {
+    if raw_span.contains(['\n', '\r']) {
+        return None;
+    }
+    let rn = vocab_norm(raw_span);
+    let vn = vocab_norm(vocab_term);
+    if rn.is_empty() || vn.is_empty() {
+        return None;
+    }
+    if rn == vn {
+        return Some((true, 0));
+    }
+    let vlen = vn.chars().count();
+    if vlen < 4 {
+        return None;
+    }
+    if ARROW.is_match(raw_span) || OPERATOR.is_match(raw_span) {
+        return None;
+    }
+    let r_digits: String = raw_span.chars().filter(|c| c.is_ascii_digit()).collect();
+    let v_digits: String = vocab_term.chars().filter(|c| c.is_ascii_digit()).collect();
+    if (!r_digits.is_empty() || !v_digits.is_empty()) && r_digits != v_digits {
+        return None;
+    }
+    let rw = words(raw_span);
+    if rw.is_empty() {
+        return None;
+    }
+    if rw.iter().any(|w| is_negative_word(w)) {
+        return None;
+    }
+    if (rw.len() == 1 && is_vocab_stop_or_modal(&rw[0]))
+        || (rw.len() > 1 && rw.iter().all(|w| is_vocab_stop_or_modal(w)))
+    {
+        return None;
+    }
+    let max_dist = match vlen {
+        4..=5 => 1,
+        6..=9 => 2,
+        _ => 3,
+    };
+    let dist = damerau_levenshtein(&rn, &vn);
+    if dist > max_dist {
+        return None;
+    }
+    let max_len = vlen.max(rn.chars().count()) as f64;
+    let sim = 1.0 - (dist as f64 / max_len);
+    let is_multi_word = rw.len() >= 2;
+    let first_match = rn.chars().next() == vn.chars().next();
+    let skel_r = consonant_skeleton(&rn);
+    let skel_v = consonant_skeleton(&vn);
+    let skeleton_match =
+        is_multi_word && first_match && skel_v.len() >= 2 && skel_r == skel_v;
+    (sim >= 0.65 || skeleton_match).then_some((false, dist))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RawTok<'a> {
+    start: usize,
+    end: usize,
+    text: &'a str,
+}
+
+fn tokenize_raw_spans(text: &str) -> Vec<RawTok<'_>> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && text[i..].chars().next().is_some_and(char::is_whitespace) {
+            i += text[i..].chars().next().unwrap().len_utf8();
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let chunk_start = i;
+        while i < bytes.len() && !text[i..].chars().next().is_some_and(char::is_whitespace) {
+            i += text[i..].chars().next().unwrap().len_utf8();
+        }
+        let mut s = chunk_start;
+        let mut e = i;
+        while s < e {
+            let ch = text[s..e].chars().next().unwrap();
+            if matches!(ch, '(' | '[' | '{' | '"' | '“' | '‘' | '\'' | '`') {
+                s += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        while s < e {
+            let ch = text[s..e].chars().next_back().unwrap();
+            if matches!(
+                ch,
+                ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '”' | '’' | '\'' | '`' | '.'
+            ) {
+                e -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if s < e {
+            out.push(RawTok {
+                start: s,
+                end: e,
+                text: &text[s..e],
+            });
+        }
+    }
+    out
+}
+
+enum FmtItem {
+    Word(String),
+    Vocab(String),
+}
+
+fn reconcile_raw_with_vocab(raw: &str, formatted: &str, vocabulary: &str) -> String {
+    if vocabulary.trim().is_empty() || raw.is_empty() || formatted.is_empty() {
+        return raw.to_owned();
+    }
+    let entries = crate::storage::vocab_words(vocabulary);
+    if entries.is_empty() {
+        return raw.to_owned();
+    }
+
+    // Locate exact configured vocab occurrences in `formatted` (longest-first, non-overlapping).
+    let mut hits: Vec<(usize, usize, &str)> = Vec::new();
+    for term in &entries {
+        if term.is_empty() {
+            continue;
+        }
+        let mut search_from = 0;
+        while let Some(rel) = formatted[search_from..].find(term.as_str()) {
+            let s = search_from + rel;
+            let e = s + term.len();
+            if has_whole_word_boundaries(formatted, s, e) {
+                hits.push((s, e, term.as_str()));
+            }
+            let step = formatted[s..].chars().next().map_or(1, char::len_utf8);
+            search_from = s + step;
+        }
+    }
+    if hits.is_empty() {
+        return raw.to_owned();
+    }
+    hits.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then_with(|| a.0.cmp(&b.0)));
+    let mut chosen_hits: Vec<(usize, usize, &str)> = Vec::new();
+    for (s, e, term) in hits {
+        if chosen_hits.iter().any(|&(cs, ce, _)| s < ce && e > cs) {
+            continue;
+        }
+        chosen_hits.push((s, e, term));
+    }
+    chosen_hits.sort_by_key(|&(s, _, _)| s);
+
+    // Build ordered item stream of words and exact vocab hits from `formatted`.
+    let mut fmt_items: Vec<FmtItem> = Vec::new();
+    let mut pos = 0;
+    for &(s, e, term) in &chosen_hits {
+        for w in words(&formatted[pos..s]) {
+            if !filler(&w) {
+                fmt_items.push(FmtItem::Word(w));
+            }
+        }
+        fmt_items.push(FmtItem::Vocab(term.to_owned()));
+        pos = e;
+    }
+    for w in words(&formatted[pos..]) {
+        if !filler(&w) {
+            fmt_items.push(FmtItem::Word(w));
+        }
+    }
+
+    let raw_tokens = tokenize_raw_spans(raw);
+    if raw_tokens.is_empty() {
+        return raw.to_owned();
+    }
+
+    let tok_matches_word = |tok: &RawTok<'_>, w: &str| {
+        tok.text.to_lowercase().replace('’', "'") == w || words(tok.text).iter().any(|tw| tw == w)
+    };
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut raw_cursor = 0usize;
+
+    for (idx, item) in fmt_items.iter().enumerate() {
+        match item {
+            FmtItem::Word(w) => {
+                let search_end = (raw_cursor + 12).min(raw_tokens.len());
+                if let Some(rel) = raw_tokens[raw_cursor..search_end]
+                    .iter()
+                    .position(|tok| tok_matches_word(tok, w))
+                {
+                    raw_cursor += rel + 1;
+                }
+            }
+            FmtItem::Vocab(term) => {
+                let next_anchor = fmt_items[idx + 1..].iter().find_map(|it| match it {
+                    FmtItem::Word(w) => Some(w.as_str()),
+                    FmtItem::Vocab(_) => None,
+                });
+                let max_span = (words(term).len() + 2).max(3).min(5);
+                let start_limit = (raw_cursor + 12).min(raw_tokens.len());
+
+                // Best candidate: (anchor_preserved, is_exact_norm, neg_dist, neg_start, span_len, s, e)
+                let mut best: Option<(bool, bool, usize, usize, usize, usize, usize)> = None;
+                for s in raw_cursor..start_limit {
+                    let e_limit = (s + max_span).min(raw_tokens.len());
+                    for e in (s + 1)..=e_limit {
+                        let span_start = raw_tokens[s].start;
+                        let span_end = raw_tokens[e - 1].end;
+                        let raw_span = &raw[span_start..span_end];
+                        let Some((is_exact, dist)) = can_reconcile_vocab(raw_span, term) else {
+                            continue;
+                        };
+                        let anchor_ok = next_anchor.is_none_or(|anc| {
+                            let anc_end = (e + 12).min(raw_tokens.len());
+                            raw_tokens[e..anc_end]
+                                .iter()
+                                .any(|tok| tok_matches_word(tok, anc))
+                        });
+                        let key = (
+                            anchor_ok,
+                            is_exact,
+                            usize::MAX - dist,
+                            usize::MAX - s,
+                            e - s,
+                        );
+                        let better = best.is_none_or(|b| {
+                            let bk = (b.0, b.1, b.2, b.3, b.4);
+                            key > bk
+                        });
+                        if better {
+                            best = Some((key.0, key.1, key.2, key.3, key.4, s, e));
+                        }
+                    }
+                }
+                if let Some((_, _, _, _, _, s, e)) = best {
+                    let span_start = raw_tokens[s].start;
+                    let span_end = raw_tokens[e - 1].end;
+                    if &raw[span_start..span_end] != term.as_str() {
+                        replacements.push((span_start, span_end, term.clone()));
+                    }
+                    raw_cursor = e;
+                }
+            }
+        }
+    }
+
+    if replacements.is_empty() {
+        return raw.to_owned();
+    }
+    replacements.sort_by_key(|&(s, _, _)| s);
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut cur = 0;
+    for (s, e, repl) in replacements {
+        if s < cur {
+            continue;
+        }
+        out.push_str(&raw[cur..s]);
+        out.push_str(&repl);
+        cur = e;
+    }
+    out.push_str(&raw[cur..]);
+    out
+}
+
+fn is_safe_strict(raw: &str, formatted: &str, vocabulary: &str) -> bool {
     if !tokens(&ARROW, raw).eq(tokens(&ARROW, formatted))
-        || !technical_literals(raw).eq(technical_literals(formatted))
+        || !technical_literals_match(raw, formatted)
     {
         return false;
     }
@@ -348,8 +1095,411 @@ pub fn is_safe(raw: &str, formatted: &str, vocabulary: &str) -> bool {
     inline_code(raw)
         .iter()
         .all(|span| final_code.contains(span))
-        && final_code.iter().all(|(_, value)| raw.contains(value))
+        && final_code
+            .iter()
+            .all(|(_, value)| raw.to_lowercase().contains(&value.to_lowercase()))
         && same_words(raw, &content, vocabulary)
+}
+
+pub fn is_safe(raw: &str, formatted: &str, vocabulary: &str) -> bool {
+    if vocabulary.trim().is_empty() {
+        return is_safe_strict(raw, formatted, "");
+    }
+    let reconciled = reconcile_raw_with_vocab(raw, formatted, vocabulary);
+    is_safe_strict(&reconciled, formatted, vocabulary)
+}
+
+fn expand_contractions(input: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(input.len() + 4);
+    for w in input {
+        match w.as_str() {
+            "don't" => out.extend(["do".into(), "not".into()]),
+            "doesn't" => out.extend(["does".into(), "not".into()]),
+            "didn't" => out.extend(["did".into(), "not".into()]),
+            "can't" | "cannot" => out.extend(["can".into(), "not".into()]),
+            "won't" => out.extend(["will".into(), "not".into()]),
+            "wouldn't" => out.extend(["would".into(), "not".into()]),
+            "couldn't" => out.extend(["could".into(), "not".into()]),
+            "shouldn't" => out.extend(["should".into(), "not".into()]),
+            "isn't" => out.extend(["is".into(), "not".into()]),
+            "aren't" => out.extend(["are".into(), "not".into()]),
+            "wasn't" => out.extend(["was".into(), "not".into()]),
+            "weren't" => out.extend(["were".into(), "not".into()]),
+            "hasn't" => out.extend(["has".into(), "not".into()]),
+            "haven't" => out.extend(["have".into(), "not".into()]),
+            "hadn't" => out.extend(["had".into(), "not".into()]),
+            "mustn't" => out.extend(["must".into(), "not".into()]),
+            "needn't" => out.extend(["need".into(), "not".into()]),
+            "shan't" => out.extend(["shall".into(), "not".into()]),
+            "i'm" => out.extend(["i".into(), "am".into()]),
+            "i'll" => out.extend(["i".into(), "will".into()]),
+            "i've" => out.extend(["i".into(), "have".into()]),
+            "you're" => out.extend(["you".into(), "are".into()]),
+            "you'll" => out.extend(["you".into(), "will".into()]),
+            "you've" => out.extend(["you".into(), "have".into()]),
+            "we're" => out.extend(["we".into(), "are".into()]),
+            "we'll" => out.extend(["we".into(), "will".into()]),
+            "we've" => out.extend(["we".into(), "have".into()]),
+            "they're" => out.extend(["they".into(), "are".into()]),
+            "they'll" => out.extend(["they".into(), "will".into()]),
+            "they've" => out.extend(["they".into(), "have".into()]),
+            "let's" => out.extend(["let".into(), "us".into()]),
+            _ => out.push(w.clone()),
+        }
+    }
+    out
+}
+
+fn is_ordered_subsequence(needle: &[String], haystack: &[String]) -> bool {
+    let mut hi = 0usize;
+    for w in needle {
+        let Some(rel) = haystack[hi..].iter().position(|h| h == w) else {
+            return false;
+        };
+        hi += rel + 1;
+    }
+    true
+}
+
+fn count_contiguous_subseq(haystack: &[String], needle: &[String]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if haystack[i..i + needle.len()] == *needle {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn preserves_triggers(raw: &str, formatted: &str, preserved_triggers: &[&str]) -> bool {
+    if preserved_triggers.is_empty() {
+        return true;
+    }
+    let before = words(raw);
+    let after = words(formatted);
+    for trigger in preserved_triggers {
+        let tw = words(trigger);
+        if tw.is_empty() {
+            continue;
+        }
+        let raw_count = count_contiguous_subseq(&before, &tw);
+        if raw_count > 0 && count_contiguous_subseq(&after, &tw) < raw_count {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_tighten_filler(w: &str) -> bool {
+    matches!(
+        w,
+        "um" | "umm"
+            | "uh"
+            | "uhh"
+            | "er"
+            | "erm"
+            | "hmm"
+            | "ah"
+            | "like"
+            | "basically"
+            | "actually"
+            | "literally"
+            | "just"
+            | "so"
+            | "well"
+            | "honestly"
+            | "seriously"
+            | "obviously"
+            | "anyway"
+            | "okay"
+            | "ok"
+            | "really"
+            | "very"
+    )
+}
+
+fn strip_tighten_fillers(input: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if i + 1 < input.len() {
+            let pair = (input[i].as_str(), input[i + 1].as_str());
+            if matches!(
+                pair,
+                ("you", "know") | ("i", "mean") | ("sort", "of") | ("kind", "of")
+            ) {
+                i += 2;
+                continue;
+            }
+        }
+        if !is_tighten_filler(&input[i]) {
+            out.push(input[i].clone());
+        }
+        i += 1;
+    }
+    out
+}
+
+fn dedup_stutters(input: &[String]) -> Vec<String> {
+    let mut out = input.to_vec();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        let mut next = Vec::with_capacity(out.len());
+        while i < out.len() {
+            let max_k = ((out.len() - i) / 2).min(6);
+            let mut matched = 0;
+            for k in (1..=max_k).rev() {
+                if out[i..i + k] == out[i + k..i + 2 * k] {
+                    matched = k;
+                    break;
+                }
+            }
+            if matched > 0 {
+                let phrase = &out[i..i + matched];
+                next.extend_from_slice(phrase);
+                i += matched;
+                while i + matched <= out.len() && &out[i..i + matched] == phrase {
+                    i += matched;
+                }
+                changed = true;
+            } else {
+                next.push(out[i].clone());
+                i += 1;
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+fn is_tighten_content_word(w: &str) -> bool {
+    !is_tighten_filler(w) && !is_non_content_word(w)
+}
+
+fn is_safe_tighten(
+    raw: &str,
+    formatted: &str,
+    vocabulary: &str,
+    preserved_triggers: &[&str],
+) -> bool {
+    let reconciled_buf;
+    let src = if vocabulary.trim().is_empty() {
+        raw
+    } else {
+        reconciled_buf = reconcile_raw_with_vocab(raw, formatted, vocabulary);
+        reconciled_buf.as_str()
+    };
+
+    if !tokens(&ARROW, src).eq(tokens(&ARROW, formatted))
+        || !technical_literals_match(src, formatted)
+    {
+        return false;
+    }
+    let Some(mut lines) = flatten_tables(src, formatted) else {
+        return false;
+    };
+    strip_lists(&mut lines);
+    let content = lines
+        .iter()
+        .filter(|line| !BORDER.is_match(line))
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix('|')
+                .and_then(|inner| inner.strip_suffix('|'))
+                .filter(|inner| !inner.is_empty() && !inner.contains('|'))
+                .map_or(line, str::trim)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if !tokens(&OPERATOR, src).eq(tokens(&OPERATOR, &content)) {
+        return false;
+    }
+    if OPERATOR.is_match(src) {
+        let src_segs: Vec<Vec<String>> = OPERATOR
+            .split(src)
+            .map(|seg| expand_contractions(&words(seg)))
+            .collect();
+        let cnt_segs: Vec<Vec<String>> = OPERATOR
+            .split(&content)
+            .map(|seg| expand_contractions(&words(seg)))
+            .collect();
+        if src_segs.len() != cnt_segs.len()
+            || !src_segs
+                .iter()
+                .zip(cnt_segs.iter())
+                .all(|(s, c)| is_ordered_subsequence(c, s))
+        {
+            return false;
+        }
+    }
+    if ARROW.is_match(src) {
+        let src_segs: Vec<Vec<String>> = ARROW
+            .split(src)
+            .map(|seg| expand_contractions(&words(seg)))
+            .collect();
+        let cnt_segs: Vec<Vec<String>> = ARROW
+            .split(&content)
+            .map(|seg| expand_contractions(&words(seg)))
+            .collect();
+        if src_segs.len() != cnt_segs.len()
+            || !src_segs.iter().zip(cnt_segs.iter()).all(|(s, c)| {
+                is_ordered_subsequence(c, s) && (s.is_empty() || !c.is_empty())
+            })
+        {
+            return false;
+        }
+    }
+
+    let final_code = inline_code(formatted);
+    if !inline_code(src)
+        .iter()
+        .all(|span| final_code.contains(span))
+        || !final_code
+            .iter()
+            .all(|(_, value)| src.to_lowercase().contains(&value.to_lowercase()))
+    {
+        return false;
+    }
+
+    let before = words(src);
+    let after = words(&content);
+    if before.is_empty() || after.is_empty() || after.len() > before.len() + 2 {
+        return false;
+    }
+    if !tokens(&NUMBER, src).eq(tokens(&NUMBER, &content))
+        || !technical_literals_match(src, &content)
+        || (PREAMBLE.is_match(content.trim()) && !PREAMBLE.is_match(src.trim()))
+    {
+        return false;
+    }
+
+    if !preserves_triggers(src, &content, preserved_triggers) {
+        return false;
+    }
+
+    let before_exp = expand_contractions(&before);
+    let after_exp = expand_contractions(&after);
+
+    if !before_exp
+        .iter()
+        .map(String::as_str)
+        .filter(|w| is_negative_word(w))
+        .eq(after_exp
+            .iter()
+            .map(String::as_str)
+            .filter(|w| is_negative_word(w)))
+    {
+        return false;
+    }
+
+    // Preserve proper names (skipping fillers and sentence-initial non-content words) and configured vocab.
+    let vocab_entries = crate::storage::vocab_words(vocabulary);
+    let count = |in_words: &[String], word: &str| in_words.iter().filter(|v| *v == word).count();
+    for m in NAME.find_iter(src) {
+        let name = m.as_str();
+        let lower = name.to_lowercase();
+        if NAMED_FILLER.is_match(name) || is_tighten_filler(&lower) {
+            continue;
+        }
+        let at_sent_start = m.start() == find_sentence_start(src, m.start())
+            || src[find_sentence_start(src, m.start())..m.start()]
+                .trim()
+                .is_empty();
+        if at_sent_start && is_non_content_word(name) {
+            continue;
+        }
+        let terms = expand_contractions(&words(name));
+        if terms
+            .iter()
+            .all(|word| count(&before_exp, word) >= count(&terms, word))
+            && terms
+                .iter()
+                .any(|word| count(&after_exp, word) < count(&terms, word))
+        {
+            return false;
+        }
+    }
+    for term in &vocab_entries {
+        let terms = expand_contractions(&words(term));
+        if terms
+            .iter()
+            .all(|word| count(&before_exp, word) >= count(&terms, word))
+            && terms
+                .iter()
+                .any(|word| count(&after_exp, word) < count(&terms, word))
+        {
+            return false;
+        }
+    }
+
+    // Strict ordered-subsequence condensation (zero invented words, preserves order).
+    if !is_ordered_subsequence(&after_exp, &before_exp) {
+        return false;
+    }
+
+    // Compute >= 55% content-word retention after removing fillers/hedges and multi-word stutters.
+    let before_base = dedup_stutters(&strip_tighten_fillers(&before_exp));
+    let before_content = before_base
+        .iter()
+        .filter(|w| is_tighten_content_word(w))
+        .count();
+    if before_content > 0 {
+        let after_content = after_exp
+            .iter()
+            .filter(|w| is_tighten_content_word(w))
+            .count();
+        if after_content * 100 < before_content * 55 {
+            return false;
+        }
+    } else if !before_base.is_empty() {
+        let after_non_filler = after_exp.iter().filter(|w| !is_tighten_filler(w)).count();
+        if after_non_filler * 100 < before_base.len() * 55 {
+            return false;
+        }
+    }
+
+    // If `src` itself contains list lines, forbid list-line regrouping.
+    if src.lines().any(|line| list_item(line).is_some())
+        && !keeps_list_lines_for_style(
+            src,
+            formatted,
+            vocabulary,
+            crate::storage::Style::Tighten,
+            preserved_triggers,
+        )
+    {
+        return false;
+    }
+
+    true
+}
+
+pub fn is_safe_for_style(
+    raw: &str,
+    formatted: &str,
+    vocabulary: &str,
+    style: crate::storage::Style,
+    preserved_triggers: &[&str],
+) -> bool {
+    match style {
+        crate::storage::Style::Clean => {
+            is_safe(raw, formatted, vocabulary)
+                && preserves_triggers(raw, formatted, preserved_triggers)
+        }
+        crate::storage::Style::Tighten => {
+            is_safe_tighten(raw, formatted, vocabulary, preserved_triggers)
+        }
+    }
 }
 
 const COUNTS: [&str; 20] = [
@@ -676,6 +1826,22 @@ fn list_item(line: &str) -> Option<&str> {
 }
 
 pub fn keeps_list_lines(local: &str, candidate: &str, vocabulary: &str) -> bool {
+    keeps_list_lines_for_style(
+        local,
+        candidate,
+        vocabulary,
+        crate::storage::Style::Clean,
+        &[],
+    )
+}
+
+fn keeps_list_lines_for_style(
+    local: &str,
+    candidate: &str,
+    vocabulary: &str,
+    style: crate::storage::Style,
+    preserved_triggers: &[&str],
+) -> bool {
     let lines = |text: &str| text.lines().filter(|line| !line.trim().is_empty()).count();
     lines(local) == lines(candidate)
         && local
@@ -684,7 +1850,9 @@ pub fn keeps_list_lines(local: &str, candidate: &str, vocabulary: &str) -> bool 
             .zip(candidate.lines().filter(|line| !line.trim().is_empty()))
             .all(
                 |(before, after)| match (list_item(before), list_item(after)) {
-                    (Some(item), Some(edited)) => is_safe(item, edited, vocabulary),
+                    (Some(item), Some(edited)) => {
+                        is_safe_for_style(item, edited, vocabulary, style, preserved_triggers)
+                    }
                     (None, None) => true,
                     _ => false,
                 },
@@ -704,6 +1872,11 @@ pub struct PreparedDictation {
     pub local_list: Option<String>,
     /// True when [`apply_self_corrections`] resolved at least one spoken self-correction.
     pub self_corrected: bool,
+    /// True when any deterministic local transform (self-correction, spoken command, or vocab post-pass) modified the transcript.
+    pub locally_edited: bool,
+    /// True when a spoken scratch/delete command discarded the entire utterance.
+    pub discarded: bool,
+    vocabulary: String,
 }
 
 impl PreparedDictation {
@@ -714,6 +1887,9 @@ impl PreparedDictation {
 
     /// Validates a model-cleaned candidate against the self-corrected source and any local list.
     pub fn is_safe_output(&self, candidate: &str, vocabulary: &str) -> bool {
+        if self.discarded {
+            return false;
+        }
         is_safe(&self.corrected, candidate, vocabulary)
             && self
                 .local_list
@@ -721,23 +1897,70 @@ impl PreparedDictation {
                 .is_none_or(|list| keeps_list_lines(list, candidate, vocabulary))
     }
 
+    /// Validates a model-cleaned candidate under the requested cleanup style while preserving
+    /// any raw snippet trigger words matched before cleanup.
+    pub fn is_safe_output_for_style(
+        &self,
+        formatted: &str,
+        style: crate::storage::Style,
+        preserved_triggers: &[&str],
+    ) -> bool {
+        if self.discarded {
+            return false;
+        }
+        is_safe_for_style(
+            &self.corrected,
+            formatted,
+            &self.vocabulary,
+            style,
+            preserved_triggers,
+        ) && self.local_list.as_deref().is_none_or(|list| {
+            keeps_list_lines_for_style(
+                list,
+                formatted,
+                &self.vocabulary,
+                style,
+                preserved_triggers,
+            )
+        })
+    }
+
     /// Local fallback text when AI cleanup is disabled, fails, or is rejected by `is_safe`.
     pub fn local_fallback(&self) -> Option<&str> {
+        if self.discarded {
+            return None;
+        }
         self.local_list
             .as_deref()
-            .or_else(|| self.self_corrected.then_some(self.corrected.as_str()))
+            .or_else(|| self.locally_edited.then_some(self.corrected.as_str()))
     }
 }
 
-/// Runs deterministic spoken self-corrections and explicit spoken-list formatting on `raw`.
+/// Runs deterministic spoken self-corrections, spoken commands, vocab post-pass, and explicit spoken-list formatting on `raw`.
 pub fn prepare_dictation(raw: &str, vocabulary: &str) -> PreparedDictation {
-    let corrected = apply_self_corrections(raw);
-    let self_corrected = corrected != raw;
+    let after_self = apply_self_corrections(raw);
+    let self_corrected = after_self != raw;
+    let (after_cmds, cmds_changed, discarded) = apply_spoken_commands(&after_self);
+    if discarded {
+        return PreparedDictation {
+            corrected: String::new(),
+            local_list: None,
+            self_corrected,
+            locally_edited: true,
+            discarded: true,
+            vocabulary: vocabulary.to_owned(),
+        };
+    }
+    let (corrected, vocab_changed) = apply_vocab_postpass(&after_cmds, vocabulary);
+    let locally_edited = self_corrected || cmds_changed || vocab_changed;
     let local_list = spoken_list(&corrected, vocabulary);
     PreparedDictation {
         corrected,
         local_list,
         self_corrected,
+        locally_edited,
+        discarded: false,
+        vocabulary: vocabulary.to_owned(),
     }
 }
 
@@ -1886,6 +3109,391 @@ pub fn apply_self_corrections(raw: &str) -> String {
     current
 }
 
+fn is_inside_quotes_or_backticks(text: &str, cmd_start: usize, cmd_end: usize) -> bool {
+    let prefix = &text[..cmd_start];
+    if prefix.chars().filter(|&c| c == '`').count() % 2 == 1
+        || prefix.chars().filter(|&c| c == '"').count() % 2 == 1
+    {
+        return true;
+    }
+    let open_curly = prefix.chars().filter(|&c| c == '“').count();
+    let close_curly = prefix.chars().filter(|&c| c == '”').count();
+    if open_curly > close_curly {
+        return true;
+    }
+    let left = prefix.trim_end().chars().next_back();
+    let right = text[cmd_end..].trim_start().chars().next();
+    if matches!(left, Some('\'' | '‘')) && matches!(right, Some('\'' | '’')) {
+        return true;
+    }
+    false
+}
+
+fn capitalize_leading_word(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) if first.is_lowercase() => {
+            format!("{}{}", first.to_uppercase(), chars.as_str())
+        }
+        _ => s.to_owned(),
+    }
+}
+
+fn prev_word_in_clause(before: &str) -> Option<String> {
+    let trimmed = before.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == ',');
+    if trimmed.ends_with(['.', '!', '?', '\n', '\r']) {
+        return None;
+    }
+    trimmed
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’')
+        .find(|w| !w.is_empty())
+        .map(|w| w.to_lowercase().replace('’', "'"))
+}
+
+fn next_immediate_word(after: &str) -> Option<String> {
+    let trimmed = after.trim_start_matches([' ', '\t']);
+    let first_ch = trimmed.chars().next()?;
+    if !first_ch.is_alphanumeric() {
+        return None;
+    }
+    trimmed
+        .split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’')
+        .next()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase().replace('’', "'"))
+}
+
+fn apply_newline_commands(text: &str) -> (String, bool) {
+    if !NEWLINE_CMD.is_match(text) {
+        return (text.to_owned(), false);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    let mut changed = false;
+    for caps in NEWLINE_CMD.captures_iter(text) {
+        let full = caps.get(0).unwrap();
+        if full.start() < pos {
+            continue;
+        }
+        let cmd = caps.name("cmd").unwrap();
+        let pre = caps.name("pre").unwrap();
+        let post = caps.name("post").unwrap();
+        let is_paragraph = cmd.as_str().to_ascii_lowercase().contains("paragraph");
+
+        if is_inside_quotes_or_backticks(text, cmd.start(), cmd.end()) {
+            continue;
+        }
+
+        // Reject when preceded by determiners/quantifiers.
+        if let Some(prev) = prev_word_in_clause(&text[..pre.start()]) {
+            if matches!(
+                prev.as_str(),
+                "a" | "an"
+                    | "the"
+                    | "this"
+                    | "that"
+                    | "my"
+                    | "your"
+                    | "our"
+                    | "one"
+                    | "each"
+                    | "every"
+                    | "another"
+                    | "next"
+                    | "last"
+                    | "same"
+            ) {
+                continue;
+            }
+        }
+
+        // Reject when immediately followed by noun-complements.
+        if let Some(next) = next_immediate_word(&text[cmd.end()..]) {
+            if matches!(
+                next.as_str(),
+                "of" | "in"
+                    | "for"
+                    | "about"
+                    | "character"
+                    | "break"
+                    | "is"
+                    | "was"
+                    | "are"
+                    | "starts"
+                    | "begins"
+                    | "here"
+                    | "there"
+                    | "at"
+                    | "to"
+                    | "with"
+                    | "from"
+                    | "after"
+                    | "before"
+            ) {
+                continue;
+            }
+        }
+
+        let after_rest = &text[post.end()..];
+        // Only strip trailing '.' after the command if more text follows it.
+        let consume_end = if after_rest.trim().is_empty() && post.as_str().contains('.') {
+            cmd.end()
+        } else {
+            post.end()
+        };
+
+        let left_slice = &text[pos..pre.start()];
+        out.push_str(left_slice);
+        if is_paragraph {
+            out.push_str("\n\n");
+        } else {
+            out.push('\n');
+        }
+        changed = true;
+        pos = consume_end;
+
+        if is_paragraph {
+            let rem = &text[pos..];
+            if let Some(first_ch) = rem.chars().next() {
+                if first_ch.is_lowercase() {
+                    for uc in first_ch.to_uppercase() {
+                        out.push(uc);
+                    }
+                    pos += first_ch.len_utf8();
+                }
+            }
+        }
+    }
+    if !changed {
+        return (text.to_owned(), false);
+    }
+    out.push_str(&text[pos..]);
+    (out, true)
+}
+
+fn try_targeted_scratch_replacement(
+    text: &str,
+    sep_start: usize,
+    repl_start: usize,
+    has_comma_sep: bool,
+    has_period_sep: bool,
+) -> Option<String> {
+    let pivot = PivotMatch {
+        kind: PivotKind::ActuallyMakeThat,
+        sep_start,
+        repl_start,
+        has_comma_sep,
+        has_period_sep,
+    };
+    let sent_start = find_sentence_start(text, sep_start);
+    let before_slice = &text[sent_start..sep_start];
+    let before_tokens = tokenize_slice(before_slice, sent_start);
+    if before_tokens.is_empty() {
+        return None;
+    }
+    let last_before = *before_tokens.last().unwrap();
+    if !text[last_before.end..sep_start].trim().is_empty() {
+        return None;
+    }
+    let after_end = find_after_clause_end(text, repl_start);
+    let after_slice = &text[repl_start..after_end];
+    let after_tokens = tokenize_slice(after_slice, repl_start);
+    if after_tokens.is_empty() {
+        return None;
+    }
+
+    let max_repl = after_tokens.len().min(5);
+    let max_target = before_tokens.len().min(5);
+    let mut best: Option<(usize, usize)> = None;
+    'search: for repl_len in (1..=max_repl).rev() {
+        let repl = &after_tokens[..repl_len];
+        let repl_is_full_clause = repl_len == after_tokens.len();
+        if !repl_is_full_clause && !is_continuation_starter(after_tokens[repl_len].text) {
+            continue;
+        }
+        for target_len in (1..=max_target).rev() {
+            let target = &before_tokens[before_tokens.len() - target_len..];
+            if spans_match(target, repl, pivot, before_tokens.len(), repl_is_full_clause) {
+                best = Some((target_len, repl_len));
+                break 'search;
+            }
+        }
+    }
+    let (target_len, repl_len) = best?;
+    let target_start = before_tokens[before_tokens.len() - target_len].start;
+    let repl_span_start = after_tokens[0].start;
+    let repl_span_end = after_tokens[repl_len - 1].end;
+    let mut replacement = text[repl_span_start..repl_span_end].to_owned();
+    if target_len == before_tokens.len()
+        && text[target_start..].chars().next().is_some_and(char::is_uppercase)
+        && replacement.chars().next().is_some_and(char::is_lowercase)
+    {
+        replacement = capitalize_leading_word(&replacement);
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..target_start]);
+    out.push_str(&replacement);
+    out.push_str(&text[repl_span_end..]);
+    Some(out)
+}
+
+fn try_apply_one_scratch_command(text: &str) -> Option<String> {
+    for caps in SCRATCH_CMD.captures_iter(text) {
+        let sep = caps.name("sep")?;
+        let cmd = caps.name("cmd")?;
+        let after = caps.name("after")?;
+        let is_delete = cmd.as_str().to_ascii_lowercase().starts_with("delete");
+
+        if is_inside_quotes_or_backticks(text, cmd.start(), cmd.end()) {
+            continue;
+        }
+
+        // Must have some spoken content before the command to scratch/delete.
+        if !WORD.is_match(&text[..sep.start()]) {
+            continue;
+        }
+
+        // Reject when preceded by modal/aux/infinitive/negation/subject words.
+        if let Some(prev) = prev_word_in_clause(&text[..sep.start()]) {
+            if matches!(
+                prev.as_str(),
+                "to" | "don't"
+                    | "not"
+                    | "never"
+                    | "can"
+                    | "can't"
+                    | "cannot"
+                    | "could"
+                    | "should"
+                    | "would"
+                    | "will"
+                    | "won't"
+                    | "must"
+                    | "please"
+                    | "want"
+                    | "need"
+                    | "let's"
+                    | "you"
+                    | "we"
+                    | "i"
+                    | "they"
+            ) {
+                continue;
+            }
+        }
+
+        let sep_str = sep.as_str();
+        let has_period_sep = sep_str.contains('.');
+        let has_comma_sep = sep_str.contains([',', ';', '—']) || sep_str.contains('-');
+        let remainder = &text[after.end()..];
+        let at_end = remainder.trim().is_empty();
+        let after_has_punct = after
+            .as_str()
+            .contains([',', '.', ';', '!', '?']);
+
+        // Extra guard for `delete that`: reject demonstrative objects like "delete that file".
+        if is_delete {
+            if !at_end && !after_has_punct {
+                let next = next_immediate_word(&text[cmd.end()..]).unwrap_or_default();
+                let is_clause_restarter = matches!(
+                    next.as_str(),
+                    "i" | "i'm"
+                        | "i'll"
+                        | "i've"
+                        | "i'd"
+                        | "we"
+                        | "we're"
+                        | "we'll"
+                        | "let's"
+                        | "set"
+                        | "send"
+                        | "call"
+                        | "make"
+                        | "meet"
+                        | "order"
+                        | "book"
+                        | "email"
+                        | "put"
+                        | "run"
+                        | "check"
+                        | "use"
+                        | "add"
+                        | "write"
+                        | "tell"
+                        | "ask"
+                        | "try"
+                        | "actually"
+                );
+                if !is_clause_restarter {
+                    continue;
+                }
+            } else if !at_end && !has_comma_sep && !has_period_sep && !after_has_punct {
+                continue;
+            }
+        }
+
+        // 1. Try targeted self-correction span replacement first.
+        if let Some(targeted) = try_targeted_scratch_replacement(
+            text,
+            sep.start(),
+            after.end(),
+            has_comma_sep,
+            has_period_sep,
+        ) {
+            return Some(targeted);
+        }
+
+        // 2. Otherwise drop back to the last sentence boundary (. ! ? \n).
+        let sent_start = find_sentence_start(text, sep.start());
+        let dropped_segment = text[sent_start..sep.start()].trim_start();
+        let was_capitalized = dropped_segment
+            .chars()
+            .next()
+            .is_some_and(char::is_uppercase);
+        let prefix = &text[..sent_start];
+        let mut rest = remainder.trim_start().to_owned();
+        if !rest.is_empty() && was_capitalized {
+            rest = capitalize_leading_word(&rest);
+        }
+
+        let out = if prefix.trim().is_empty() {
+            rest
+        } else if rest.is_empty() {
+            prefix.trim_end().to_owned()
+        } else if prefix.ends_with('\n') {
+            format!("{prefix}{rest}")
+        } else {
+            format!("{} {rest}", prefix.trim_end())
+        };
+        return Some(out);
+    }
+    None
+}
+
+fn apply_spoken_commands(raw: &str) -> (String, bool, bool) {
+    if raw.is_empty() || raw.len() > 2_000_000 {
+        return (raw.to_owned(), false, false);
+    }
+    let (mut current, mut changed) = apply_newline_commands(raw);
+    let mut scratch_applied = false;
+    for _ in 0..16 {
+        let Some(next) = try_apply_one_scratch_command(&current) else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+        changed = true;
+        scratch_applied = true;
+        if current.trim().is_empty() {
+            return (String::new(), true, true);
+        }
+    }
+    let discarded = scratch_applied && current.trim().is_empty();
+    (current, changed, discarded)
+}
+
 #[cfg(test)]
 mod list_tests {
     use super::*;
@@ -2097,5 +3705,238 @@ mod list_tests {
             "Make a grocery list:\n- apples\n- peaches.",
             ""
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Style;
+
+    #[test]
+    fn vocab_deterministic_postpass_and_reconciled_is_safe() {
+        let vocab = "Ollama, CLAUDE.md, OpenCode, listen-rs, Next.js, Rust, Git, Claude";
+
+        // Deterministic post-pass fixes exact case-insensitive and structured separator-collapsed matches.
+        let cases = [
+            ("run ollama locally", "run Ollama locally"),
+            ("update claude md first", "update CLAUDE.md first"),
+            ("launch open code now", "launch OpenCode now"),
+            ("build listen rs", "build listen-rs"),
+            ("deploy next.js app", "deploy Next.js app"),
+            // Exact casing inside backticks or URLs is skipped.
+            ("Run `ollama` and check ollama", "Run `ollama` and check Ollama"),
+            (
+                "Visit https://ollama.com for ollama",
+                "Visit https://ollama.com for Ollama",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let prep = prepare_dictation(raw, vocab);
+            assert_eq!(prep.corrected, expected, "raw={raw}");
+            assert!(prep.locally_edited, "expected locally_edited for {raw}");
+            assert!(!prep.discarded);
+        }
+
+        // Deterministic pass NEVER fuzzy-matches common words like must -> Rust, get -> Git, olama -> Ollama.
+        for untouched in ["must fix this", "get it done", "check olama logs"] {
+            let prep = prepare_dictation(untouched, vocab);
+            assert_eq!(prep.corrected, untouched, "must not touch {untouched}");
+            assert!(!prep.locally_edited);
+        }
+
+        // Reconciled-Raw is_safe accepts verified vocab corrections (fuzzy >=4 chars & exact norm).
+        for (raw, formatted) in [
+            ("check olama logs", "Check Ollama logs."),
+            ("check Olama logs", "Check Ollama logs."),
+            ("check oh lama logs", "Check Ollama logs."),
+            ("update claude md", "Update CLAUDE.md."),
+            ("launch open code", "Launch OpenCode."),
+            ("build listen rs", "Build listen-rs."),
+        ] {
+            assert!(
+                is_safe(raw, formatted, vocab),
+                "expected is_safe to accept {raw:?} -> {formatted:?}"
+            );
+        }
+
+        // Anti-hallucination rejections remain strictly enforced.
+        for (raw, formatted) in [
+            ("I like dogs", "I like Ollama"),
+            ("send the mail", "send the Claude"),
+            ("get it", "Git it"),
+            ("must fix", "Rust fix"),
+            ("just fix", "Rust fix"),
+            (r"check olama in C:\a\b.py", "check Ollama in C:/a/b.py"),
+        ] {
+            assert!(
+                !is_safe(raw, formatted, vocab),
+                "expected is_safe to reject {raw:?} -> {formatted:?}"
+            );
+        }
+
+        // Empty vocabulary preserves 100% strict behavior.
+        assert!(!is_safe("check olama logs", "Check Ollama logs.", ""));
+    }
+
+    #[test]
+    fn spoken_commands_apply_safely_and_preserve_prose() {
+        // Accepted spoken commands.
+        let p1 = prepare_dictation("the build passed new paragraph now let's test the UI", "");
+        assert!(p1.locally_edited);
+        assert!(!p1.discarded);
+        assert_eq!(p1.corrected, "the build passed\n\nNow let's test the UI");
+        assert!(p1.is_safe_output("The build passed.\n\nNow let's test the UI.", ""));
+
+        let p2 = prepare_dictation("set the port to 8080 scratch that set the port to 3000", "");
+        assert!(p2.locally_edited);
+        assert!(!p2.discarded);
+        assert_eq!(p2.corrected, "set the port to 3000");
+        assert!(p2.is_safe_output("Set the port to 3000.", ""));
+
+        let p3 = prepare_dictation("Hello new line world.", "");
+        assert!(p3.locally_edited);
+        assert!(!p3.discarded);
+        assert_eq!(p3.corrected, "Hello\nworld.");
+
+        let p4 = prepare_dictation("Hi Alice. Send at 4 PM, scratch that, send at 5 PM.", "");
+        assert!(p4.locally_edited);
+        assert!(!p4.discarded);
+        assert_eq!(p4.corrected, "Hi Alice. Send at 5 PM.");
+
+        // Prose guards: all of these MUST remain untouched.
+        for prose in [
+            "Add a new line of code.",
+            "Write a new paragraph about testing.",
+            "The new line is faster.",
+            "Don't scratch that.",
+            "Please delete that file.",
+            "We should not delete that.",
+            "Use `new line` here.",
+        ] {
+            let p = prepare_dictation(prose, "");
+            assert_eq!(p.corrected, prose, "prose must stay untouched: {prose}");
+            assert!(!p.locally_edited, "locally_edited must be false for: {prose}");
+            assert!(!p.discarded, "discarded must be false for: {prose}");
+        }
+
+        // Full-utterance scratch sets discarded = true and never falls back to raw.
+        let discarded = prepare_dictation("Send at 4 PM scratch that", "");
+        assert!(discarded.discarded);
+        assert!(discarded.locally_edited);
+        assert!(discarded.corrected.is_empty());
+        assert_eq!(discarded.local_fallback(), None);
+        assert!(!discarded.is_safe_output("Send at 4 PM scratch that", ""));
+
+        // Preserve formatting.rs:1936 contract: spoken_list returns None on ambiguous scratch that.
+        assert_eq!(
+            spoken_list(
+                "Make a shopping list with three items: apples, bananas, scratch that pears, and milk.",
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn style_tighten_condenses_fillers_but_enforces_hard_invariants() {
+        // Accepts filler/hedge removal and multi-word stutter dedup.
+        assert!(is_safe_for_style(
+            "Um so I basically just want to ship it",
+            "I want to ship it.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(is_safe_for_style(
+            "I want to I want to ship",
+            "I want to ship.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        // Safe contraction mapping preserving negation count.
+        assert!(is_safe_for_style(
+            "Do not delete the file",
+            "Don't delete the file.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+
+        // Hard invariants remain strictly rejected under Style::Tighten.
+        assert!(!is_safe_for_style("3 PM", "2 PM", "", Style::Tighten, &[]));
+        assert!(!is_safe_for_style(
+            "Do not delete",
+            "Delete",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(!is_safe_for_style(
+            "I like it",
+            "I like this.",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+
+        // Rejects list line regrouping (`- apples mac`).
+        let list_prep = prepare_dictation("Make a grocery list: apples, pears, mac and cheese.", "");
+        assert!(!list_prep.is_safe_output_for_style(
+            "Make a grocery list:\n- apples mac\n- pears and cheese.",
+            Style::Tighten,
+            &[]
+        ));
+        assert!(!is_safe_for_style(
+            "- apples\n- pears\n- mac and cheese",
+            "- apples mac\n- pears and cheese",
+            "",
+            Style::Tighten,
+            &[]
+        ));
+
+        // Rejects dropping preserved snippet trigger words.
+        assert!(!is_safe_for_style(
+            "Please send it to my email soon",
+            "Send it to email soon.",
+            "",
+            Style::Tighten,
+            &["my email"]
+        ));
+        assert!(is_safe_for_style(
+            "Um basically send it to my email soon",
+            "Send it to my email soon.",
+            "",
+            Style::Tighten,
+            &["my email"]
+        ));
+
+        // Style::Clean stays strict.
+        assert!(!is_safe_for_style(
+            "Um so I basically just want to ship it",
+            "I want to ship it.",
+            "",
+            Style::Clean,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn technical_tone_backtick_casing_passes_is_safe() {
+        assert!(is_safe("Run Cargo Test", "Run `cargo test`", ""));
+        assert!(is_safe("Edit readme.md", "Edit `README.md`", ""));
+
+        // Unbackticked path/literal corruption or case change outside vocab is still rejected.
+        assert!(!is_safe("Edit readme.md", "Edit README.md", ""));
+        assert!(!is_safe(r"open C:\work\app.py", "open C:/work/app.py", ""));
+        assert!(!is_safe(
+            r"open C:\work\app.py",
+            "open `C:/work/app.py`",
+            ""
+        ));
+        assert!(!is_safe("run --dry-run", "run --dry_run", ""));
+        // Already-backticked spans in raw still require exact case preservation.
+        assert!(!is_safe("Edit `readme.md`", "Edit `README.md`", ""));
     }
 }

@@ -273,9 +273,10 @@ fn set_setting(core: &Core, key: &str, value: &Value) -> bool {
             ("target", Some("auto"), _) => s.prompt_target = PromptTarget::Auto,
             ("target", Some("general"), _) => s.prompt_target = PromptTarget::General,
             ("target", Some("claude_code"), _) => s.prompt_target = PromptTarget::ClaudeCode,
-            ("vocab", Some(vocab), _) if vocab.len() <= MAX_VOCAB && !vocab.contains('\0') => {
-                s.vocab = vocab.into()
-            }
+            ("vocab", Some(vocab), _) => match sanitize_vocab(vocab) {
+                Ok(clean) => s.vocab = clean,
+                Err(_) => return false,
+            },
             ("cloud_enabled", _, Some(allowed)) => s.cloud_enabled = allowed,
             ("engine" | "judge", Some(id), _) => {
                 let Some(provider) = PromptProvider::ALL.into_iter().find(|route| route.id() == id) else { return false };
@@ -292,37 +293,95 @@ fn set_setting(core: &Core, key: &str, value: &Value) -> bool {
     saved
 }
 
+pub(crate) fn sanitize_vocab(vocab: &str) -> Result<String, String> {
+    if vocab.contains('\0') {
+        return Err("Vocabulary cannot contain NUL bytes.".into());
+    }
+    if vocab.len() > MAX_VOCAB {
+        return Err(format!(
+            "Vocabulary is too long (maximum {MAX_VOCAB} bytes)."
+        ));
+    }
+    Ok(vocab.to_owned())
+}
+
+fn validate_vocab_word(word: &str) -> Result<&str, String> {
+    let trimmed = word.trim();
+    if trimmed.is_empty() {
+        return Err("Vocabulary term cannot be empty.".into());
+    }
+    if trimmed.len() > 100 {
+        return Err("Vocabulary term is too long (maximum 100 bytes).".into());
+    }
+    if trimmed.contains([',', ';', '\n', '\r', '\0']) {
+        return Err(
+            "Vocabulary term cannot contain commas, semicolons, line breaks, or NUL bytes.".into(),
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Validates and adds a single word to `settings.vocab`, preserving the user's existing
+/// newline vs. comma delimiter style, deduplicating case-insensitively via
+/// `storage::vocab_words`, enforcing `MAX_VOCAB` and NUL checks, and pruning the word
+/// from `settings.vocab_dismissed`.
+///
+/// Returns `Ok(true)` if the word was newly appended, `Ok(false)` if already present.
+pub(crate) fn add_vocab_word(settings: &mut Settings, word: &str) -> Result<bool, String> {
+    let word = validate_vocab_word(word)?;
+    let lower = word.to_lowercase();
+    let already_present = storage::vocab_words(&settings.vocab)
+        .iter()
+        .any(|entry| entry.to_lowercase() == lower);
+    if already_present {
+        settings
+            .vocab_dismissed
+            .retain(|entry| entry.to_lowercase() != lower);
+        return Ok(false);
+    }
+    let use_newlines = settings.vocab.contains('\n');
+    let old = settings
+        .vocab
+        .trim_end_matches([',', ';', ' ', '\t', '\n', '\r']);
+    let candidate = if old.is_empty() {
+        word.to_owned()
+    } else if use_newlines {
+        format!("{old}\n{word}")
+    } else {
+        format!("{old}, {word}")
+    };
+    let clean = sanitize_vocab(&candidate)?;
+    settings.vocab = clean;
+    settings
+        .vocab_dismissed
+        .retain(|entry| entry.to_lowercase() != lower);
+    Ok(true)
+}
+
+pub(crate) fn dismiss_vocab_word(settings: &mut Settings, word: &str) -> Result<bool, String> {
+    let word = validate_vocab_word(word)?;
+    let lower = word.to_lowercase();
+    if settings
+        .vocab_dismissed
+        .iter()
+        .any(|entry| entry.to_lowercase() == lower)
+    {
+        return Ok(false);
+    }
+    settings.vocab_dismissed.push(word.to_owned());
+    Ok(true)
+}
+
 fn change_word(core: &Core, word: &Value, dismiss: bool) -> bool {
-    let Some(word) = word.as_str().map(str::trim).filter(|word| {
-        !word.is_empty() && word.len() <= 100 && !word.contains([',', '\n', '\r', '\0'])
-    }) else {
+    let Some(word) = word.as_str() else {
         return false;
     };
     update(core, |s| {
         if dismiss {
-            if !s
-                .vocab_dismissed
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(word))
-            {
-                s.vocab_dismissed.push(word.into());
-            }
-        } else if !storage::vocab_words(&s.vocab)
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(word))
-        {
-            let old = s.vocab.trim_end_matches([',', ' ', '\n', '\r']);
-            let vocab = if old.is_empty() {
-                word.into()
-            } else {
-                format!("{old}, {word}")
-            };
-            if vocab.len() > MAX_VOCAB {
-                return false;
-            }
-            s.vocab = vocab;
+            dismiss_vocab_word(s, word).is_ok()
+        } else {
+            add_vocab_word(s, word).is_ok()
         }
-        true
     })
 }
 
@@ -360,31 +419,41 @@ pub(crate) fn local_models_response(preview: bool, url: &str, selected: String) 
     }
 }
 
+pub(crate) fn upsert_snippet(
+    snippets: &mut Vec<crate::snippets::Snippet>,
+    trigger: &str,
+    expansion: &str,
+) -> Result<(), String> {
+    let snippet = crate::snippets::validate_snippet(trigger, expansion)?;
+    if let Some(existing) = snippets
+        .iter_mut()
+        .find(|item| crate::snippets::triggers_equal(&item.trigger, &snippet.trigger))
+    {
+        *existing = snippet;
+        return Ok(());
+    }
+    if snippets.len() >= MAX_SNIPPETS {
+        return Err(format!("You can save up to {MAX_SNIPPETS} snippets."));
+    }
+    snippets.push(snippet);
+    Ok(())
+}
+
 fn add_snippet(core: &Core, args: &[Value]) -> Value {
     let trigger = args.first().and_then(Value::as_str).unwrap_or("");
     let expansion = args.get(1).and_then(Value::as_str).unwrap_or("");
-    let snippet = match crate::snippets::validate_snippet(trigger, expansion) {
-        Ok(s) => s,
-        Err(msg) => return json!({ "ok": false, "message": msg }),
-    };
-    let mut overflow = false;
+    let mut err_msg: Option<String> = None;
     let saved = update(core, |s| {
-        if let Some(existing) = s
-            .snippets
-            .iter_mut()
-            .find(|item| item.trigger.eq_ignore_ascii_case(&snippet.trigger))
-        {
-            *existing = snippet.clone();
-        } else if s.snippets.len() >= MAX_SNIPPETS {
-            overflow = true;
-            return false;
-        } else {
-            s.snippets.push(snippet.clone());
+        match upsert_snippet(&mut s.snippets, trigger, expansion) {
+            Ok(()) => true,
+            Err(msg) => {
+                err_msg = Some(msg);
+                false
+            }
         }
-        true
     });
-    if overflow {
-        return json!({ "ok": false, "message": format!("You can save up to {MAX_SNIPPETS} snippets.") });
+    if let Some(msg) = err_msg {
+        return json!({ "ok": false, "message": msg });
     }
     if !saved {
         return json!({ "ok": false, "message": "Could not save snippet." });
@@ -400,7 +469,8 @@ fn delete_snippet(core: &Core, args: &[Value]) -> Value {
     }
     let saved = update(core, |s| {
         let before = s.snippets.len();
-        s.snippets.retain(|item| !item.trigger.eq_ignore_ascii_case(trigger));
+        s.snippets
+            .retain(|item| !crate::snippets::triggers_equal(&item.trigger, trigger));
         s.snippets.len() != before
     });
     if !saved {
@@ -786,5 +856,165 @@ mod tests {
         let sample_id = meetings["notes"][0]["id"].as_u64().unwrap();
         assert_eq!(call(&core, "delete_meeting", &[json!(sample_id)]).unwrap()["ok"], true);
         assert_eq!(call(&core, "get_meetings", &[]).unwrap()["notes"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn vocab_cap_nul_newline_preservation_and_dismissed_pruning() {
+        // 1. Existing newline-formatted vocab preserves '\n' delimiter, rejects ';',
+        //    deduplicates Unicode case-insensitively, and prunes accepted words from vocab_dismissed.
+        let (core, _) = Core::new(
+            Settings {
+                vocab: "Parakeet\nCafé".into(),
+                vocab_dismissed: vec!["Kubernetes".into(), "Other".into()],
+                ..Default::default()
+            },
+            true,
+        );
+        // Rejects semicolon and NUL inside an accepted word.
+        assert_eq!(call(&core, "add_vocab", &[json!("Foo; Bar")]), Some(json!(false)));
+        assert_eq!(call(&core, "add_vocab", &[json!("Foo\0Bar")]), Some(json!(false)));
+        // Unicode case-insensitive dedup does not duplicate "Café".
+        assert_eq!(call(&core, "add_vocab", &[json!("café")]), Some(json!(true)));
+        assert_eq!(
+            call(&core, "get_settings", &[]).unwrap()["vocab"],
+            "Parakeet\nCafé"
+        );
+        // Accepting a previously dismissed word appends with '\n' and prunes vocab_dismissed.
+        assert_eq!(call(&core, "add_vocab", &[json!("kubernetes")]), Some(json!(true)));
+        assert_eq!(
+            call(&core, "get_settings", &[]).unwrap()["vocab"],
+            "Parakeet\nCafé\nkubernetes"
+        );
+        assert_eq!(
+            core.settings.lock().unwrap().vocab_dismissed,
+            vec!["Other".to_string()]
+        );
+
+        // 2. Comma-formatted vocab appends with ", " and enforces MAX_VOCAB & NUL rejection.
+        let (core2, _) = Core::new(
+            Settings {
+                vocab: "Alpha, Beta".into(),
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(call(&core2, "add_vocab", &[json!("Gamma")]), Some(json!(true)));
+        assert_eq!(
+            call(&core2, "get_settings", &[]).unwrap()["vocab"],
+            "Alpha, Beta, Gamma"
+        );
+        assert_eq!(
+            call(&core2, "set_setting", &[json!("vocab"), json!("bad\0vocab")]),
+            Some(json!(false))
+        );
+        let too_big = "a".repeat(MAX_VOCAB + 1);
+        assert_eq!(
+            call(&core2, "set_setting", &[json!("vocab"), json!(too_big)]),
+            Some(json!(false))
+        );
+        let near_cap = "a".repeat(MAX_VOCAB - 2);
+        assert_eq!(
+            call(&core2, "set_setting", &[json!("vocab"), json!(near_cap)]),
+            Some(json!(true))
+        );
+        assert_eq!(call(&core2, "add_vocab", &[json!("overflow")]), Some(json!(false)));
+
+        // 3. Direct helper parity (the exact functions called by app.rs):
+        assert!(sanitize_vocab("ok, vocab").is_ok());
+        assert!(sanitize_vocab("bad\0vocab").is_err());
+        assert!(sanitize_vocab(&"x".repeat(MAX_VOCAB + 1)).is_err());
+
+        let mut s = Settings {
+            vocab: "Rust\nParakeet\n".into(),
+            vocab_dismissed: vec!["Ollama".into(), "KeepMe".into()],
+            ..Default::default()
+        };
+        assert!(add_vocab_word(&mut s, "bad;word").is_err());
+        assert_eq!(add_vocab_word(&mut s, "ollama").unwrap(), true);
+        assert_eq!(s.vocab, "Rust\nParakeet\nollama");
+        assert_eq!(s.vocab_dismissed, vec!["KeepMe".to_string()]);
+        // Re-adding an existing word is idempotent and returns Ok(false).
+        assert_eq!(add_vocab_word(&mut s, "PARAKEET").unwrap(), false);
+        // Semicolon-separated existing vocab deduplicates via storage::vocab_words.
+        let mut semi = Settings {
+            vocab: "Alpha; Beta".into(),
+            vocab_dismissed: vec!["Beta".into()],
+            ..Default::default()
+        };
+        assert_eq!(add_vocab_word(&mut semi, "beta").unwrap(), false);
+        assert!(semi.vocab_dismissed.is_empty());
+        assert_eq!(dismiss_vocab_word(&mut semi, "Café").unwrap(), true);
+        assert_eq!(dismiss_vocab_word(&mut semi, "café").unwrap(), false);
+    }
+
+    #[test]
+    fn snippet_unicode_whitespace_dedup_and_max_cap() {
+        // Seed a legacy unnormalized whitespace trigger plus a Unicode trigger.
+        let mut initial = vec![
+            crate::snippets::Snippet {
+                trigger: "my  email".into(),
+                expansion: "old@example.com".into(),
+            },
+            crate::snippets::Snippet {
+                trigger: "café".into(),
+                expansion: "Old Café".into(),
+            },
+        ];
+        for i in 2..MAX_SNIPPETS {
+            initial.push(crate::snippets::Snippet {
+                trigger: format!("trigger {i}"),
+                expansion: format!("expansion {i}"),
+            });
+        }
+        assert_eq!(initial.len(), MAX_SNIPPETS);
+
+        let (core, _) = Core::new(
+            Settings {
+                snippets: initial,
+                ..Default::default()
+            },
+            true,
+        );
+
+        // At MAX_SNIPPETS (200), updating an existing Unicode trigger (different case) succeeds without growing.
+        let upd_unicode = call(&core, "add_snippet", &[json!("CAFÉ"), json!("New Café")]).unwrap();
+        assert_eq!(upd_unicode["ok"], true);
+        assert_eq!(upd_unicode["snippets"].as_array().unwrap().len(), MAX_SNIPPETS);
+        assert_eq!(upd_unicode["snippets"][1]["expansion"], "New Café");
+
+        // At MAX_SNIPPETS (200), updating an existing legacy multi-space trigger succeeds without growing.
+        let upd_ws = call(&core, "add_snippet", &[json!("MY   \t EMAIL"), json!("new@example.com")]).unwrap();
+        assert_eq!(upd_ws["ok"], true);
+        assert_eq!(upd_ws["snippets"].as_array().unwrap().len(), MAX_SNIPPETS);
+        assert_eq!(upd_ws["snippets"][0]["trigger"], "MY EMAIL");
+        assert_eq!(upd_ws["snippets"][0]["expansion"], "new@example.com");
+
+        // Adding a 201st distinct trigger is blocked with a clear error.
+        let overflow = call(&core, "add_snippet", &[json!("brand new trigger"), json!("val")]).unwrap();
+        assert_eq!(overflow["ok"], false);
+        assert!(
+            overflow["message"].as_str().unwrap_or("").contains("200"),
+            "expected cap error mentioning 200, got: {overflow}"
+        );
+        assert_eq!(core.settings.lock().unwrap().snippets.len(), MAX_SNIPPETS);
+
+        // Deleting by Unicode/whitespace variant removes the matching snippet.
+        let del = call(&core, "delete_snippet", &[json!("  CAFÉ ")]).unwrap();
+        assert_eq!(del["ok"], true);
+        assert_eq!(del["snippets"].as_array().unwrap().len(), MAX_SNIPPETS - 1);
+
+        // Direct upsert_snippet helper parity (the exact function called by app.rs).
+        let mut direct: Vec<crate::snippets::Snippet> = (0..MAX_SNIPPETS)
+            .map(|i| crate::snippets::Snippet {
+                trigger: if i == 0 { "café  note".into() } else { format!("snip {i}") },
+                expansion: format!("exp {i}"),
+            })
+            .collect();
+        assert!(upsert_snippet(&mut direct, "CAFÉ\tnote", "updated").is_ok());
+        assert_eq!(direct.len(), MAX_SNIPPETS);
+        assert_eq!(direct[0].trigger, "CAFÉ note");
+        assert_eq!(direct[0].expansion, "updated");
+        assert!(upsert_snippet(&mut direct, "distinct 201st", "nope").is_err());
+        assert_eq!(direct.len(), MAX_SNIPPETS);
     }
 }

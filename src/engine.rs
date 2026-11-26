@@ -571,13 +571,15 @@ fn preclean_worker(core: Arc<Core>, gen: u64, settings: Settings, tone: crate::a
         }
         // Only pre-clean chunks that already end at a sentence boundary so mid-sentence thinking
         // pauses never cause Ollama to insert bogus periods across the seam.
-        let outcome = if !ends_sentence(&raw) {
+        let outcome = if !ends_sentence(&raw) || has_cross_chunk_command(&raw) {
             PieceClean::Skipped
         } else {
-            let (cleaned, note) = clean_transcript_with_tone(&settings, &raw, tone, |text| {
+            match clean_transcript_outcome(&settings, &raw, tone, |text| {
                 cleanup::clean_dictation_with_tone(&settings, text, tone)
-            });
-            PieceClean::Done(cleaned, note)
+            }) {
+                TranscriptResult::Discarded => PieceClean::Skipped,
+                TranscriptResult::Deliver { cleaned, note } => PieceClean::Done(cleaned, note),
+            }
         };
         let mut cache = lock.lock().unwrap();
         if cache.gen != gen || cache.abandoned {
@@ -811,12 +813,25 @@ fn standalone_snippet_expansion(raw: &str, snippets: &[crate::snippets::Snippet]
     if snippets.is_empty() {
         return None;
     }
-    let (expanded, did_expand) = crate::snippets::expand_snippets(raw, snippets);
-    if did_expand && snippets.iter().any(|sn| expanded.trim() == sn.expansion.trim()) {
-        Some(expanded)
-    } else {
-        None
+    let res = crate::snippets::expand_snippets_detailed(raw, snippets);
+    res.standalone.then_some(res.text)
+}
+
+fn matched_snippet_triggers<'a>(
+    text: &str,
+    snippets: &'a [crate::snippets::Snippet],
+) -> Vec<&'a str> {
+    if text.is_empty() || snippets.is_empty() {
+        return Vec::new();
     }
+    snippets
+        .iter()
+        .filter(|sn| {
+            !sn.trigger.trim().is_empty()
+                && crate::snippets::expand_snippets_detailed(text, std::slice::from_ref(sn)).matched
+        })
+        .map(|sn| sn.trigger.as_str())
+        .collect()
 }
 
 fn transcribe_meeting_audio(core: &Core, samples: &[f32], vocab: &str) -> Vec<String> {
@@ -1495,6 +1510,12 @@ fn is_already_clean_short(settings: &Settings, raw: &str) -> bool {
     count > 0
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TranscriptResult {
+    Discarded,
+    Deliver { cleaned: String, note: String },
+}
+
 #[cfg(test)]
 fn clean_transcript(
     settings: &Settings,
@@ -1504,33 +1525,59 @@ fn clean_transcript(
     clean_transcript_with_tone(settings, raw, crate::app_tone::TonePreset::Default, clean)
 }
 
+#[cfg(test)]
 fn clean_transcript_with_tone(
     settings: &Settings,
     raw: &str,
     tone: crate::app_tone::TonePreset,
     clean: impl FnOnce(&str) -> Result<String, String>,
 ) -> (String, String) {
+    match clean_transcript_outcome(settings, raw, tone, clean) {
+        TranscriptResult::Discarded => (String::new(), String::new()),
+        TranscriptResult::Deliver { cleaned, note } => (cleaned, note),
+    }
+}
+
+fn clean_transcript_outcome(
+    settings: &Settings,
+    raw: &str,
+    tone: crate::app_tone::TonePreset,
+    clean: impl FnOnce(&str) -> Result<String, String>,
+) -> TranscriptResult {
     let prepared = crate::formatting::prepare_dictation(raw, &settings.vocab);
+    if prepared.discarded {
+        return TranscriptResult::Discarded;
+    }
     if !settings.cleanup {
-        return if prepared.self_corrected {
-            (prepared.corrected, String::new())
+        let cleaned = if prepared.locally_edited {
+            prepared.corrected
         } else {
-            (String::new(), String::new())
+            String::new()
+        };
+        return TranscriptResult::Deliver {
+            cleaned,
+            note: String::new(),
         };
     }
     if tone == crate::app_tone::TonePreset::Default
         && is_already_clean_short(settings, &prepared.corrected)
     {
-        return match prepared.local_fallback() {
-            Some(text) => (text.to_owned(), String::new()),
-            None => (String::new(), String::new()),
+        let cleaned = prepared.local_fallback().unwrap_or_default().to_owned();
+        return TranscriptResult::Deliver {
+            cleaned,
+            note: String::new(),
         };
     }
-    let vocabulary = &settings.vocab;
     let input = prepared.model_input();
+    let preserved_triggers = matched_snippet_triggers(input, &settings.snippets);
     let note = match clean(input) {
-        Ok(text) if prepared.is_safe_output(&text, vocabulary) => {
-            return (text, String::new());
+        Ok(text)
+            if prepared.is_safe_output_for_style(&text, settings.style, &preserved_triggers) =>
+        {
+            return TranscriptResult::Deliver {
+                cleaned: text,
+                note: String::new(),
+            };
         }
         Ok(_) => " Formatting changed too much, so your exact words were used.".into(),
         Err(error) => format!(" Formatting skipped ({error})."),
@@ -1542,10 +1589,80 @@ fn clean_transcript_with_tone(
             } else {
                 note
             };
-            (text.to_owned(), fallback_note)
+            TranscriptResult::Deliver {
+                cleaned: text.to_owned(),
+                note: fallback_note,
+            }
         }
-        None => (String::new(), note),
+        None => TranscriptResult::Deliver {
+            cleaned: String::new(),
+            note,
+        },
     }
+}
+
+fn resolve_dictation_outcome(
+    settings: &Settings,
+    raw: &str,
+    tone: crate::app_tone::TonePreset,
+    precleaned: Option<(String, String)>,
+    clean: impl FnOnce(&str) -> Result<String, String>,
+) -> TranscriptResult {
+    if let Some(expanded) = standalone_snippet_expansion(raw, &settings.snippets) {
+        return TranscriptResult::Deliver {
+            cleaned: expanded,
+            note: String::new(),
+        };
+    }
+    let (mut cleaned, note) = match precleaned {
+        Some(result) => result,
+        None => match clean_transcript_outcome(settings, raw, tone, clean) {
+            TranscriptResult::Discarded => return TranscriptResult::Discarded,
+            TranscriptResult::Deliver { cleaned, note } => (cleaned, note),
+        },
+    };
+    if !settings.snippets.is_empty() {
+        let base = if cleaned.is_empty() {
+            raw
+        } else {
+            cleaned.as_str()
+        };
+        let (expanded, did_expand) = crate::snippets::expand_snippets(base, &settings.snippets);
+        if did_expand {
+            cleaned = expanded;
+        }
+    }
+    TranscriptResult::Deliver { cleaned, note }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_dictation_outcome(
+    core: &Core,
+    raw: String,
+    outcome: TranscriptResult,
+    secs: f32,
+    speech_secs: f32,
+    total_secs: f32,
+    target: Option<Target>,
+    deliver: impl FnOnce(
+        &str,
+        Option<Target>,
+    ) -> Result<crate::winput::Delivery, crate::winput::DeliveryError>,
+    copy_fallback: impl FnOnce(&str) -> bool,
+) -> Option<String> {
+    let TranscriptResult::Deliver { cleaned, note } = outcome else {
+        core.set_status("Dictation discarded.");
+        core.set_outcome("Discarded", 2.0);
+        core.cue(Cue::Cancel);
+        return None;
+    };
+    let delivered = save_and_deliver_using(
+        core, raw, cleaned, secs, total_secs, target, deliver, copy_fallback,
+    )?;
+    core.set_status(format!(
+        "Done — {delivered}. {secs:.1} s of speech recognised in {speech_secs:.1} s, total {total_secs:.1} s.{note}"
+    ));
+    Some(delivered)
 }
 
 fn recording_failed(core: &Core, message: String) {
@@ -1662,6 +1779,7 @@ fn assemble_precleaned_with_tone(
     let prepared = crate::formatting::prepare_dictation(raw, &settings.vocab);
     if !settings.cleanup
         || committed.is_empty()
+        || prepared.discarded
         || prepared.self_corrected
         || prepared.local_list.is_some()
         || has_cross_chunk_command(raw)
@@ -1691,7 +1809,10 @@ fn assemble_precleaned_with_tone(
         String::new()
     } else {
         let (tail_cleaned, tail_note) =
-            clean_transcript_with_tone(settings, tail_raw, tone, clean_tail);
+            match clean_transcript_outcome(settings, tail_raw, tone, clean_tail) {
+                TranscriptResult::Discarded => return None,
+                TranscriptResult::Deliver { cleaned, note } => (cleaned, note),
+            };
         if tail_cleaned.contains('\n') {
             return None;
         }
@@ -1708,7 +1829,8 @@ fn assemble_precleaned_with_tone(
     if combined == raw {
         return Some((String::new(), note));
     }
-    if crate::formatting::is_safe(raw, &combined, &settings.vocab) {
+    let preserved_triggers = matched_snippet_triggers(prepared.model_input(), &settings.snippets);
+    if prepared.is_safe_output_for_style(&combined, settings.style, &preserved_triggers) {
         Some((combined, note))
     } else {
         None
@@ -1916,98 +2038,93 @@ fn process(core: &Arc<Core>, samples: Vec<f32>, held: Duration, target: Option<T
     core.shared.lock().unwrap().live_text = raw.clone();
 
     let tone = resolve_target_tone(&s, target);
-    let standalone_snippet = standalone_snippet_expansion(&raw, &s.snippets);
-
-    let (cleaned, note) = if let Some(expanded) = standalone_snippet {
+    let outcome = if let Some(expanded) = standalone_snippet_expansion(&raw, &s.snippets) {
         abandon_live_cache(core, gen);
-        (expanded, String::new())
+        TranscriptResult::Deliver {
+            cleaned: expanded,
+            note: String::new(),
+        }
     } else {
         let prepared = crate::formatting::prepare_dictation(&raw, &s.vocab);
-        let mut precleaned_result = None;
-        if s.cleanup
-            && transcript.preclean_eligible
-            && transcript.committed_count > 0
-            && !prepared.self_corrected
-            && prepared.local_list.is_none()
-            && !has_cross_chunk_command(&raw)
-        {
-            let committed_pieces = {
-                let (lock, cvar) = &core.live_cache;
-                let mut cache = lock.lock().unwrap();
-                let same_cleanup = cache.gen == gen
-                    && cache.cleanup == s.cleanup
-                    && cache.style == s.style
-                    && cache.tone == tone
-                    && cache.quiet_mode == s.quiet_mode
-                    && cache.local_model == s.local_model
-                    && cache.ollama_url == s.ollama_url
-                    && cache.vocab == s.vocab;
-                if same_cleanup {
-                    let deadline = Instant::now() + cleanup::CLEANUP_TIMEOUT;
-                    while cache.gen == gen
-                        && cache.preclean_active
-                        && !cache.abandoned
-                        && cache.committed.len() >= transcript.committed_count
-                        && cache.committed[..transcript.committed_count]
-                            .iter()
-                            .any(|p| p.cleaned == PieceClean::Pending)
-                    {
-                        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
-                            break;
-                        };
-                        let (guard, timeout) = cvar.wait_timeout(cache, rem).unwrap();
-                        cache = guard;
-                        if timeout.timed_out() {
-                            break;
+        if prepared.discarded {
+            abandon_live_cache(core, gen);
+            TranscriptResult::Discarded
+        } else {
+            let mut precleaned_result = None;
+            if s.cleanup
+                && transcript.preclean_eligible
+                && transcript.committed_count > 0
+                && !prepared.self_corrected
+                && prepared.local_list.is_none()
+                && !has_cross_chunk_command(&raw)
+            {
+                let committed_pieces = {
+                    let (lock, cvar) = &core.live_cache;
+                    let mut cache = lock.lock().unwrap();
+                    let same_cleanup = cache.gen == gen
+                        && cache.cleanup == s.cleanup
+                        && cache.style == s.style
+                        && cache.tone == tone
+                        && cache.quiet_mode == s.quiet_mode
+                        && cache.local_model == s.local_model
+                        && cache.ollama_url == s.ollama_url
+                        && cache.vocab == s.vocab;
+                    if same_cleanup {
+                        let deadline = Instant::now() + cleanup::CLEANUP_TIMEOUT;
+                        while cache.gen == gen
+                            && cache.preclean_active
+                            && !cache.abandoned
+                            && cache.committed.len() >= transcript.committed_count
+                            && cache.committed[..transcript.committed_count]
+                                .iter()
+                                .any(|p| p.cleaned == PieceClean::Pending)
+                        {
+                            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                                break;
+                            };
+                            let (guard, timeout) = cvar.wait_timeout(cache, rem).unwrap();
+                            cache = guard;
+                            if timeout.timed_out() {
+                                break;
+                            }
                         }
-                    }
-                    if cache.gen == gen && cache.committed.len() >= transcript.committed_count {
-                        Some(cache.committed[..transcript.committed_count].to_vec())
+                        if cache.gen == gen && cache.committed.len() >= transcript.committed_count {
+                            Some(cache.committed[..transcript.committed_count].to_vec())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
+                };
+                // Stop `preclean_worker` before running any tail or fallback Ollama call so it never
+                // contends with Finish on the GPU.
+                abandon_live_cache(core, gen);
+                if let Some(pieces) = committed_pieces {
+                    precleaned_result = assemble_precleaned_with_tone(
+                        &s,
+                        &raw,
+                        &pieces,
+                        &transcript.tail_raw,
+                        tone,
+                        |text| {
+                            core.set_status("Formatting…");
+                            core.shared.lock().unwrap().live_note = "Formatting".into();
+                            core.repaint();
+                            cleanup::clean_dictation_with_tone(&s, text, tone)
+                        },
+                    );
                 }
-            };
-            // Stop `preclean_worker` before running any tail or fallback Ollama call so it never
-            // contends with Finish on the GPU.
-            abandon_live_cache(core, gen);
-            if let Some(pieces) = committed_pieces {
-                precleaned_result = assemble_precleaned_with_tone(
-                    &s,
-                    &raw,
-                    &pieces,
-                    &transcript.tail_raw,
-                    tone,
-                    |text| {
-                        core.set_status("Formatting…");
-                        core.shared.lock().unwrap().live_note = "Formatting".into();
-                        core.repaint();
-                        cleanup::clean_dictation_with_tone(&s, text, tone)
-                    },
-                );
+            } else {
+                abandon_live_cache(core, gen);
             }
-        } else {
-            abandon_live_cache(core, gen);
-        }
-        let (mut cleaned, note) = match precleaned_result {
-            Some(result) => result,
-            None => clean_transcript_with_tone(&s, &raw, tone, |text| {
+            resolve_dictation_outcome(&s, &raw, tone, precleaned_result, |text| {
                 core.set_status("Formatting…");
                 core.shared.lock().unwrap().live_note = "Formatting".into();
                 core.repaint();
                 cleanup::clean_dictation_with_tone(&s, text, tone)
-            }),
-        };
-        if !s.snippets.is_empty() {
-            let base = if cleaned.is_empty() { raw.as_str() } else { cleaned.as_str() };
-            let (expanded, did_expand) = crate::snippets::expand_snippets(base, &s.snippets);
-            if did_expand {
-                cleaned = expanded;
-            }
+            })
         }
-        (cleaned, note)
     };
     let copy = |text: &str| {
         !core.preview
@@ -2017,14 +2134,23 @@ fn process(core: &Arc<Core>, samples: Vec<f32>, held: Duration, target: Option<T
     let allow_ctrl_v = s.registered_hotkey.as_deref() != Some("ctrl+v");
     let restore_clipboard = s.restore_clipboard;
     // Deliver to whichever text box has focus when processing finishes (unless Destination is Workspace).
-    let final_target = if core.preview || s.destination == Destination::Workspace {
+    let final_target = if matches!(outcome, TranscriptResult::Discarded)
+        || core.preview
+        || s.destination == Destination::Workspace
+    {
         target
     } else {
         let live = crate::winput::capture_target();
         if live.is_some() { live } else { target }
     };
-    if let Some(outcome) = save_and_deliver_using(
-        core, raw, cleaned, secs, t0.elapsed().as_secs_f32(), final_target,
+    apply_dictation_outcome(
+        core,
+        raw,
+        outcome,
+        secs,
+        speech_secs,
+        t0.elapsed().as_secs_f32(),
+        final_target,
         |text, target| {
             // Trailing space on single-line dictation keeps back-to-back dictations separated,
             // matching original Listen (`dictate.py`), while History and clipboard recovery keep
@@ -2037,12 +2163,7 @@ fn process(core: &Arc<Core>, samples: Vec<f32>, held: Duration, target: Option<T
             crate::winput::deliver_dictation(&spoken, target, allow_ctrl_v, restore_clipboard)
         },
         copy,
-    ) {
-        core.set_status(format!(
-            "Done — {outcome}. {secs:.1} s of speech recognised in {speech_secs:.1} s, total {:.1} s.{note}",
-            t0.elapsed().as_secs_f32()
-        ));
-    }
+    );
 }
 
 fn save_and_deliver_command(
@@ -2091,6 +2212,7 @@ fn save_and_deliver_inner(
         outcome: if to_workspace { "saved for Prompt Lab" } else { "saved · delivery not confirmed" }.to_string(),
         app_name,
         app_icon,
+        ..Default::default()
     };
     let text = entry.text().to_owned();
     if let Err(error) = storage::append_history(&entry) {
@@ -2646,5 +2768,161 @@ mod offline_flow {
             standalone_snippet_expansion("Send it to my email please.", &snippets),
             None
         );
+    }
+
+    #[test]
+    fn cleanup_off_applies_locally_edited_vocab_and_spoken_commands() {
+        let settings = Settings {
+            cleanup: false,
+            vocab: "Ollama, CLAUDE.md, listen-rs".into(),
+            ..Settings::default()
+        };
+
+        let (vocab_out, note) = clean_transcript(&settings, "check ollama and claude md in listen rs", |_| {
+            panic!("cleanup is off")
+        });
+        assert_eq!(vocab_out, "check Ollama and CLAUDE.md in listen-rs");
+        assert!(note.is_empty());
+
+        let (para_out, _) = clean_transcript(&settings, "the build passed new paragraph now test the UI", |_| {
+            panic!("cleanup is off")
+        });
+        assert_eq!(para_out, "the build passed\n\nNow test the UI");
+
+        let (scratch_out, _) = clean_transcript(
+            &settings,
+            "set the port to 8080 scratch that set the port to 3000",
+            |_| panic!("cleanup is off"),
+        );
+        assert_eq!(scratch_out, "set the port to 3000");
+    }
+
+    #[test]
+    fn standalone_snippet_does_not_misclassify_inline_collision() {
+        use crate::snippets::validate_snippet;
+
+        let snippets = vec![
+            validate_snippet("a", "hello").unwrap(),
+            validate_snippet("b", "hello world").unwrap(),
+        ];
+        // "a world" expands inline snippet "a" to "hello world", which happens to equal snippet "b"'s
+        // expansion, but it is NOT a standalone trigger and must still flow through normal cleanup.
+        assert_eq!(standalone_snippet_expansion("a world", &snippets), None);
+        assert_eq!(
+            standalone_snippet_expansion("b.", &snippets).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn style_tighten_accepts_trigger_preserving_condensation_and_rejects_trigger_drop() {
+        use crate::app_tone::TonePreset;
+        use crate::snippets::validate_snippet;
+
+        let snippets = vec![
+            validate_snippet("my email", "cam@example.com").unwrap(),
+            validate_snippet("follow up", "follow up next week").unwrap(),
+        ];
+        let settings = Settings {
+            cleanup: true,
+            style: crate::storage::Style::Tighten,
+            snippets,
+            ..Settings::default()
+        };
+
+        // Filler-heavy condensation preserving the snippet trigger passes `is_safe_output_for_style`,
+        // and inline snippet expansion happens strictly post-Ollama.
+        let outcome = resolve_dictation_outcome(
+            &settings,
+            "Um so I basically just want to send it to my email",
+            TonePreset::Default,
+            None,
+            |input| {
+                assert_eq!(input, "Um so I basically just want to send it to my email");
+                Ok("I want to send it to my email.".into())
+            },
+        );
+        assert_eq!(
+            outcome,
+            TranscriptResult::Deliver {
+                cleaned: "I want to send it to cam@example.com.".into(),
+                note: String::new(),
+            }
+        );
+
+        // Hyphenated raw match ("follow-up") for multi-word trigger ("follow up") is preserved and expanded post-Ollama.
+        let hyphen_outcome = resolve_dictation_outcome(
+            &settings,
+            "Um so let's follow-up tomorrow",
+            TonePreset::Default,
+            None,
+            |input| {
+                assert_eq!(input, "Um so let's follow-up tomorrow");
+                Ok("Let's follow-up tomorrow.".into())
+            },
+        );
+        assert_eq!(
+            hyphen_outcome,
+            TranscriptResult::Deliver {
+                cleaned: "Let's follow up next week tomorrow.".into(),
+                note: String::new(),
+            }
+        );
+
+        // Dropping the raw snippet trigger during Tighten condensation must be rejected so
+        // post-Ollama snippet expansion still sees the trigger in the raw fallback.
+        let (rejected, rej_note) = clean_transcript(
+            &settings,
+            "Um so please send it to my email tomorrow",
+            |_| Ok("Send it tomorrow.".into()),
+        );
+        assert!(rejected.is_empty(), "dropping snippet trigger must fall back to raw");
+        assert!(rej_note.contains("changed too much"), "unexpected note: {rej_note}");
+    }
+
+    #[test]
+    fn discarded_dictation_aborts_cleanly_without_pasting_raw() {
+        use crate::app_tone::TonePreset;
+        use crate::snippets::validate_snippet;
+
+        let snippets = vec![validate_snippet("my email", "cam@example.com").unwrap()];
+        for (cleanup_on, raw) in [
+            (true, "Send at 4 PM scratch that"),
+            (false, "Send at 4 PM scratch that"),
+            (true, "Send at 4 PM, delete that"),
+            (true, "my email scratch that"),
+        ] {
+            let settings = Settings {
+                cleanup: cleanup_on,
+                sounds: false,
+                snippets: snippets.clone(),
+                ..Settings::default()
+            };
+            let (core, events) = Core::new(settings.clone(), true);
+            let outcome = resolve_dictation_outcome(&settings, raw, TonePreset::Default, None, |_| {
+                panic!("discarded dictation must not invoke AI cleanup: {raw}")
+            });
+            assert_eq!(outcome, TranscriptResult::Discarded, "raw={raw} cleanup={cleanup_on}");
+
+            let delivered = apply_dictation_outcome(
+                &core,
+                raw.to_owned(),
+                outcome,
+                1.0,
+                0.2,
+                0.3,
+                None,
+                |_, _| panic!("discarded dictation must never deliver/paste raw"),
+                |_| panic!("discarded dictation must never copy raw to clipboard"),
+            );
+            assert_eq!(delivered, None);
+            let sh = core.shared.lock().unwrap();
+            assert_eq!(sh.outcome.as_ref().map(|(m, _)| m.as_str()), Some("Discarded"));
+            assert_eq!(sh.status, "Dictation discarded.");
+            assert!(
+                events.try_iter().next().is_none(),
+                "discarded dictation must not emit History, ToWorkspace, or Retained events"
+            );
+        }
     }
 }

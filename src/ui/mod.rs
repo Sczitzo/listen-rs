@@ -254,6 +254,7 @@ pub enum UiAction {
     UpdateVocab(String),
     AcceptVocabSuggestion(String),
     DismissVocabSuggestion(String),
+    ClearDismissedVocab,
 
     // Prompt Lab
     LabDraftChanged(String),

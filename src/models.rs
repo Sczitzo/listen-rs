@@ -976,7 +976,7 @@ const BENCHMARK_CASES: &[BenchCase] = &[
         must_contain: &["build passed", "test the UI"],
         banned_words: &[],
         banned_substrings: &["new paragraph"],
-        check_safe: false,
+        check_safe: true,
         check_list: false,
         require_paragraph: true,
     },
@@ -985,7 +985,7 @@ const BENCHMARK_CASES: &[BenchCase] = &[
         must_contain: &["set", "port", "3000"],
         banned_words: &["8080"],
         banned_substrings: &["scratch that"],
-        check_safe: false,
+        check_safe: true,
         check_list: false,
         require_paragraph: false,
     },
@@ -1034,7 +1034,12 @@ fn has_ai_preamble(text: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
-fn eval_benchmark_case(case: &BenchCase, raw: &str, prepared: &str, out: &str) -> bool {
+fn eval_benchmark_case(
+    case: &BenchCase,
+    raw: &str,
+    prepared: &formatting::PreparedDictation,
+    out: &str,
+) -> bool {
     let normalized = out.replace("\r\n", "\n");
     let trimmed = normalized.trim();
     if trimmed.is_empty()
@@ -1069,10 +1074,14 @@ fn eval_benchmark_case(case: &BenchCase, raw: &str, prepared: &str, out: &str) -
     if case.require_paragraph && !trimmed.contains("\n\n") {
         return false;
     }
-    if case.check_list && prepared != raw && !formatting::keeps_list_lines(prepared, trimmed, "") {
-        return false;
+    if case.check_list {
+        if let Some(local_list) = prepared.local_list.as_deref() {
+            if !formatting::keeps_list_lines(local_list, trimmed, "") {
+                return false;
+            }
+        }
     }
-    if case.check_safe && !formatting::is_safe(raw, trimmed, "") {
+    if case.check_safe && !prepared.is_safe_output(trimmed, "") {
         return false;
     }
     true
@@ -1316,10 +1325,9 @@ impl BenchmarkManager {
                         BENCHMARK_CASES.len()
                     ),
                 );
-                let prepared = formatting::spoken_list(case.raw, "")
-                    .unwrap_or_else(|| case.raw.to_owned());
+                let prepared = formatting::prepare_dictation(case.raw, "");
                 let t0 = Instant::now();
-                let res = cleanup::clean_dictation(&run_settings, &prepared);
+                let res = cleanup::clean_dictation(&run_settings, prepared.model_input());
                 let elapsed = t0.elapsed().as_secs_f64();
                 match res {
                     Ok(out) => {
@@ -1653,43 +1661,74 @@ mod tests {
 
     #[test]
     fn benchmark_evaluator_and_storage_round_trip() {
+        let prep0 = formatting::prepare_dictation(BENCHMARK_CASES[0].raw, "");
         assert!(eval_benchmark_case(
             &BENCHMARK_CASES[0],
             BENCHMARK_CASES[0].raw,
-            BENCHMARK_CASES[0].raw,
+            &prep0,
             "So I want to ship the settings fix today."
         ));
         assert!(!eval_benchmark_case(
             &BENCHMARK_CASES[0],
             BENCHMARK_CASES[0].raw,
-            BENCHMARK_CASES[0].raw,
+            &prep0,
             "Um, so I want to ship the, uh, settings fix today."
         ));
+
+        let prep6 = formatting::prepare_dictation(BENCHMARK_CASES[6].raw, "");
+        assert!(BENCHMARK_CASES[6].check_safe);
+        assert!(eval_benchmark_case(
+            &BENCHMARK_CASES[6],
+            BENCHMARK_CASES[6].raw,
+            &prep6,
+            "The build passed.\n\nNow let's test the UI."
+        ));
+        assert!(!eval_benchmark_case(
+            &BENCHMARK_CASES[6],
+            BENCHMARK_CASES[6].raw,
+            &prep6,
+            "The build passed. Now let's test the UI."
+        ));
+
+        let prep7 = formatting::prepare_dictation(BENCHMARK_CASES[7].raw, "");
+        assert!(BENCHMARK_CASES[7].check_safe);
         assert!(eval_benchmark_case(
             &BENCHMARK_CASES[7],
             BENCHMARK_CASES[7].raw,
-            BENCHMARK_CASES[7].raw,
+            &prep7,
             "Set the port to 3000."
         ));
         assert!(!eval_benchmark_case(
             &BENCHMARK_CASES[7],
             BENCHMARK_CASES[7].raw,
+            &prep7,
+            "Set the port to 9000."
+        ));
+        assert!(!eval_benchmark_case(
+            &BENCHMARK_CASES[7],
             BENCHMARK_CASES[7].raw,
+            &prep7,
             "Sure! Here is your text: set the port to 3000."
         ));
+
+        let prep9 = formatting::prepare_dictation(BENCHMARK_CASES[9].raw, "");
         assert!(eval_benchmark_case(
             &BENCHMARK_CASES[9],
             BENCHMARK_CASES[9].raw,
-            BENCHMARK_CASES[9].raw,
+            &prep9,
             "We need to make paste instant instead of typing letter by letter."
         ));
         let list_raw = BENCHMARK_CASES[5].raw;
-        let list_prepared = formatting::spoken_list(list_raw, "").expect("case 5 should trigger spoken_list");
+        let list_prepared = formatting::prepare_dictation(list_raw, "");
+        assert!(
+            list_prepared.local_list.is_some(),
+            "case 5 should trigger spoken_list"
+        );
         assert!(eval_benchmark_case(
             &BENCHMARK_CASES[5],
             list_raw,
             &list_prepared,
-            &list_prepared
+            list_prepared.model_input()
         ));
         assert_eq!(median(vec![0.9, 0.3, 0.5]), 0.5);
         assert_eq!(median(vec![0.8, 0.2, 0.4, 0.6]), 0.5);

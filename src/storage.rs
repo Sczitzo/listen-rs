@@ -384,6 +384,8 @@ pub struct HistoryEntry {
     pub app_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
 }
 
 impl HistoryEntry {
@@ -421,55 +423,143 @@ fn read_history_rows(path: &Path) -> Vec<HistoryEntry> {
     bytes.split(|byte| *byte == b'\n').filter_map(|row| serde_json::from_slice(row).ok()).collect()
 }
 
-/// Vocabulary words already listed (original vocab_words: split on commas and new lines).
+/// Vocabulary words already listed (split on commas, new lines, and semicolons).
 pub fn vocab_words(vocab: &str) -> Vec<String> {
-    vocab.split([',', '\n']).map(|w| w.trim()).filter(|w| !w.is_empty()).map(|w| w.to_string()).collect()
+    vocab
+        .split([',', '\n', ';'])
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect()
 }
 
+/// Lowercase stop-words excluded from automatic vocabulary suggestions (matched case-insensitively).
 const SUGGEST_STOP: &[&str] = &[
-    "I", "I'm", "I'll", "I've", "OK", "Claude", "AI", "API", "The", "A", "An", "And", "But", "So", "Then", "If",
-    "When", "What", "Why", "How", "Also", "Yes", "No", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-    "Saturday", "Sunday", "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "i", "i'm", "i'll", "i've", "i'd", "ok", "okay", "claude", "ai", "api",
+    "am", "pm", "us", "uk", "eu", "ui", "ux", "os", "id", "tv", "pc", "hr", "pr", "qa",
+    "the", "a", "an", "and", "but", "or", "nor", "for", "yet", "so", "then", "if",
+    "when", "what", "why", "how", "who", "where", "which", "also", "yes", "no", "not",
+    "it", "is", "in", "on", "at", "to", "of", "by", "as", "be", "do", "go", "we", "he", "me", "my", "up",
+    "all", "are", "was", "were", "has", "had", "have", "can", "will", "would", "could", "should", "must",
+    "might", "shall", "this", "that", "these", "those", "they", "them", "their", "there", "here",
+    "you", "your", "our", "out", "now", "new", "one", "two", "too", "its", "his", "her", "him", "she",
+    "from", "with", "into", "over", "just", "like", "more", "some", "such", "very", "only",
+    "please", "thanks", "thank", "hello", "hey", "hi", "dear", "best", "regards", "cheers",
+    "fyi", "tbd", "tba", "eta", "asap", "usa", "utc", "gmt", "est", "pst", "cst", "mst",
+    "ceo", "cto", "cfo",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december",
 ];
 
-/// Original suggest_vocab (dictate.py 331): capitalised words seen mid-sentence at least twice
-/// in history, minus known and dismissed words, most frequent first, at most `limit`.
-/// (The original also adds hand corrections from learned.json; the rebuild has none.)
+fn is_shouting_entry(text: &str) -> bool {
+    let mut alpha = 0usize;
+    let mut upper = 0usize;
+    let mut words = 0usize;
+    let mut all_upper_words = 0usize;
+    for raw_word in text.split_whitespace() {
+        let mut w_alpha = 0usize;
+        let mut w_upper = 0usize;
+        for c in raw_word.chars() {
+            if c.is_alphabetic() {
+                w_alpha += 1;
+                if c.is_uppercase() {
+                    w_upper += 1;
+                }
+            }
+        }
+        if w_alpha > 0 {
+            alpha += w_alpha;
+            upper += w_upper;
+            words += 1;
+            if w_alpha >= 2 && w_upper == w_alpha {
+                all_upper_words += 1;
+            }
+        }
+    }
+    words >= 2 && all_upper_words >= 2 && upper * 5 >= alpha * 4
+}
+
+/// Capitalised words and acronyms seen mid-sentence at least twice in dictation history,
+/// minus known and dismissed words, case-insensitively merged (choosing the most frequent
+/// casing), most frequent first, at most `limit`.
 pub fn suggest_vocab(history: &[HistoryEntry], vocab: &str, dismissed: &[String], limit: usize) -> Vec<String> {
     let mut known: std::collections::HashSet<String> = vocab_words(vocab).iter().map(|w| w.to_lowercase()).collect();
     known.extend(dismissed.iter().map(|w| w.to_lowercase()));
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Map lowercase key -> (exact casing variant -> frequency)
+    let mut counts: std::collections::HashMap<String, std::collections::HashMap<String, usize>> =
+        std::collections::HashMap::new();
     for e in history {
+        if e.kind == "command" {
+            continue;
+        }
         let text = e.text();
+        if is_shouting_entry(text) {
+            continue;
+        }
         let mut start_of_sentence = true;
         let mut tok = String::new();
         let mut flush = |tok: &mut String, sos: &mut bool| {
-            if tok.len() >= 2 {
-                let first_upper = tok.chars().next().map_or(false, |c| c.is_ascii_uppercase());
-                let all_upper = tok.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase());
-                if !*sos && first_upper && !all_upper && !SUGGEST_STOP.contains(&tok.as_str()) {
-                    *counts.entry(tok.clone()).or_default() += 1;
+            let trimmed = tok.trim_end_matches(['\'', '’', '-']);
+            if !trimmed.is_empty() {
+                let char_len = trimmed.chars().count();
+                if !*sos && char_len >= 2 {
+                    let first_upper = trimmed.chars().next().is_some_and(|c| c.is_uppercase());
+                    let all_upper = trimmed.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase());
+                    let acronym_ok = !all_upper || char_len >= 3;
+                    if first_upper && acronym_ok {
+                        let lower = trimmed.to_lowercase();
+                        if !SUGGEST_STOP.contains(&lower.as_str()) {
+                            *counts.entry(lower).or_default().entry(trimmed.to_owned()).or_default() += 1;
+                        }
+                    }
                 }
                 *sos = false;
             }
             tok.clear();
         };
-        for c in text.chars() {
-            let ok = if tok.is_empty() { c.is_ascii_alphabetic() } else { c.is_ascii_alphanumeric() || c == '\'' || c == '’' || c == '-' };
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            let ok = if tok.is_empty() {
+                c.is_alphabetic()
+            } else {
+                c.is_alphanumeric() || c == '\'' || c == '’' || c == '-'
+            };
             if ok {
                 tok.push(c);
             } else {
                 flush(&mut tok, &mut start_of_sentence);
-                if matches!(c, '.' | '!' | '?') {
+                if c.is_numeric() {
+                    start_of_sentence = false;
+                } else if matches!(c, '!' | '?' | '\n') {
+                    start_of_sentence = true;
+                } else if c == '.' && !chars.peek().is_some_and(|next| next.is_alphanumeric()) {
                     start_of_sentence = true;
                 }
             }
         }
         flush(&mut tok, &mut start_of_sentence);
     }
-    let mut out: Vec<(String, usize)> = counts.into_iter().filter(|(t, c)| *c >= 2 && !known.contains(&t.to_lowercase())).collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out: Vec<(String, usize)> = counts
+        .into_iter()
+        .filter_map(|(lower, forms)| {
+            if known.contains(&lower) {
+                return None;
+            }
+            let total: usize = forms.values().sum();
+            if total < 2 {
+                return None;
+            }
+            let best_form = forms
+                .into_iter()
+                .max_by(|(a_form, a_cnt), (b_form, b_cnt)| {
+                    a_cnt.cmp(b_cnt).then_with(|| b_form.cmp(a_form))
+                })
+                .map(|(form, _)| form)?;
+            Some((best_form, total))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out.into_iter().take(limit).map(|(t, _)| t).collect()
 }
 
@@ -607,9 +697,17 @@ mod history_tests {
     }
 }
 
-pub fn clear_history() {
+fn remove_history_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn clear_history() -> std::io::Result<()> {
     flush_history_updates();
-    let _ = std::fs::remove_file(data_dir().join("history.jsonl"));
+    remove_history_file(&data_dir().join("history.jsonl"))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -660,5 +758,119 @@ pub fn now_stamp() -> (String, u64) {
     #[cfg(not(windows))]
     {
         (format!("t+{unix}"), unix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(text: &str) -> HistoryEntry {
+        HistoryEntry {
+            raw: text.into(),
+            cleaned: text.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn suggest_vocab_unicode_semicolons_acronyms_and_sos() {
+        // Semicolon-delimited vocab parsed consistently alongside commas and newlines.
+        assert_eq!(
+            vocab_words("Alpha; Beta, Gamma\nDelta ;  Epsilon "),
+            vec!["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        );
+
+        let history = vec![
+            // Unicode proper nouns mid-sentence
+            entry("We met at Café yesterday."),
+            entry("The Café served great coffee."),
+            entry("Take an Über home."),
+            entry("Book an Über now."),
+            // Case-insensitive count merging choosing most-frequent casing
+            entry("Push to GitHub today."),
+            entry("Open GitHub PR."),
+            entry("Check Github issues."),
+            // Acronyms >= 3 chars suggested; 2-char & stop-list excluded
+            entry("Run CUDA kernels with WASM support."),
+            entry("Optimize CUDA and WASM builds."),
+            entry("Meet at AM and PM with OK and US and UI and OS and ID and AI and API and THE and AND."),
+            entry("Again AM and PM with OK and US and UI and OS and ID and AI and API and THE and AND."),
+            // Per-entry shouting guard skips all-caps shouting utterances
+            entry("DO NOT DELETE THIS FILE"),
+            entry("DO NOT DELETE THIS FILE"),
+            // 1-char starter ("I Parakeet") and internal-dot non-reset ("Check CLAUDE.md and Parakeet")
+            entry("I Parakeet daily."),
+            entry("Check CLAUDE.md and Parakeet."),
+            // Semicolon-separated known vocab entry should be excluded
+            entry("Deploy Kubernetes now."),
+            entry("Scale Kubernetes cluster."),
+            // Command Mode entries must be skipped completely
+            HistoryEntry {
+                raw: "Rewrite using CommandOnlyWord.".into(),
+                cleaned: "Rewrite using CommandOnlyWord.".into(),
+                kind: "command".into(),
+                ..Default::default()
+            },
+            HistoryEntry {
+                raw: "Make CommandOnlyWord concise.".into(),
+                cleaned: "Make CommandOnlyWord concise.".into(),
+                kind: "command".into(),
+                ..Default::default()
+            },
+        ];
+
+        let suggestions = suggest_vocab(&history, "Existing; Kubernetes", &[], 20);
+
+        assert!(suggestions.contains(&"Café".to_string()), "expected Café in {suggestions:?}");
+        assert!(suggestions.contains(&"Über".to_string()), "expected Über in {suggestions:?}");
+        assert!(suggestions.contains(&"GitHub".to_string()), "expected GitHub in {suggestions:?}");
+        assert!(!suggestions.contains(&"Github".to_string()), "Github should merge into GitHub: {suggestions:?}");
+        assert!(suggestions.contains(&"CUDA".to_string()), "expected CUDA in {suggestions:?}");
+        assert!(suggestions.contains(&"WASM".to_string()), "expected WASM in {suggestions:?}");
+        assert!(suggestions.contains(&"Parakeet".to_string()), "expected Parakeet in {suggestions:?}");
+
+        for excluded in [
+            "Kubernetes", "CommandOnlyWord", "AM", "PM", "OK", "US", "UI", "OS", "ID", "AI", "API",
+            "THE", "AND", "DO", "NOT", "DELETE", "THIS", "FILE",
+        ] {
+            assert!(
+                !suggestions.iter().any(|s| s.eq_ignore_ascii_case(excluded)),
+                "unexpected stop/shouting/known/command word {excluded} in {suggestions:?}"
+            );
+        }
+
+        // Internal-dot non-reset even when the capitalized word immediately follows `CLAUDE.md`.
+        let dot_history = vec![
+            entry("Check CLAUDE.md Parakeet."),
+            entry("Check v2.0 Parakeet."),
+        ];
+        assert_eq!(suggest_vocab(&dot_history, "", &[], 10), vec!["Parakeet".to_string()]);
+
+        // HistoryEntry.kind backward compatibility: omitted on legacy JSON & empty serialization.
+        let legacy: HistoryEntry = serde_json::from_str(r#"{"raw":"hello"}"#).unwrap();
+        assert_eq!(legacy.kind, "");
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_json.contains("\"kind\""));
+        let cmd = HistoryEntry { raw: "fix".into(), kind: "command".into(), ..Default::default() };
+        let cmd_json = serde_json::to_string(&cmd).unwrap();
+        assert!(cmd_json.contains("\"kind\":\"command\""));
+        let cmd_roundtrip: HistoryEntry = serde_json::from_str(&cmd_json).unwrap();
+        assert_eq!(cmd_roundtrip.kind, "command");
+
+        // remove_history_file: Ok(()) on existing file and NotFound, Err on real filesystem failure.
+        let dir = std::env::temp_dir().join(format!("listen-rs-clear-history-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("history.jsonl");
+        std::fs::write(&file, b"{\"raw\":\"hi\"}\n").unwrap();
+        assert!(remove_history_file(&file).is_ok());
+        assert!(!file.exists());
+        assert!(remove_history_file(&file).is_ok(), "NotFound should return Ok(())");
+        let blocker_dir = dir.join("not-a-file");
+        std::fs::create_dir(&blocker_dir).unwrap();
+        assert!(remove_history_file(&blocker_dir).is_err(), "real remove_file error should propagate");
+        std::fs::remove_dir(&blocker_dir).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

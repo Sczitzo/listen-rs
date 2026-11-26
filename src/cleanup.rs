@@ -30,10 +30,18 @@ The transcript is given between <transcript> tags; do not output the tags.";
 const STYLE_CLEAN: &str = " Keep the wording as spoken; do not rephrase or shorten.";
 const STYLE_TIGHTEN: &str = " Where the speech rambles or repeats, tighten the wording into \
 clear, articulate sentences while preserving the full meaning.";
-const FORMAT_INSTRUCTIONS: &str = " Structure warranted speech as paragraphs, bullets, consecutive numbered \
+const FORMAT_INSTRUCTIONS_CLEAN: &str = " Structure warranted speech as paragraphs, bullets, consecutive numbered \
 or lettered lists, or simple Markdown tables. Preserve every content word in order, \
 including names, quantities, negations, commands, paths and technical literals. \
 Remove only fillers and immediately repeated words. Change punctuation, capitalization and layout. \
+Prefer prose when structure requires guessing. Keep one item per line, and retain introductions and spoken ordinals. \
+Use spoken section names as headings. Table headers must be spoken or neutral Item, Detail, Details, Value, \
+Category or Measure. A marker cannot replace a quantity.";
+const FORMAT_INSTRUCTIONS_TIGHTEN: &str = " Structure warranted speech as paragraphs, bullets, consecutive numbered \
+or lettered lists, or simple Markdown tables. You may remove filler words, discourse hedges, and repeated stutters, \
+and tighten rambling phrasing without inventing new content words. \
+Preserve every fact, number, quantity, name, negation, command, path, technical literal, and configured vocabulary term, \
+and keep existing list structure intact. \
 Prefer prose when structure requires guessing. Keep one item per line, and retain introductions and spoken ordinals. \
 Use spoken section names as headings. Table headers must be spoken or neutral Item, Detail, Details, Value, \
 Category or Measure. A marker cannot replace a quantity.";
@@ -165,13 +173,16 @@ pub fn system_prompt_with_tone(style: Style, vocab: &str, tone: crate::app_tone:
         Style::Clean => STYLE_CLEAN,
         Style::Tighten => STYLE_TIGHTEN,
     });
-    s.push_str(FORMAT_INSTRUCTIONS);
+    s.push_str(match style {
+        Style::Clean => FORMAT_INSTRUCTIONS_CLEAN,
+        Style::Tighten => FORMAT_INSTRUCTIONS_TIGHTEN,
+    });
     let tone_suffix = crate::app_tone::tone_prompt_suffix(tone);
     if !tone_suffix.is_empty() {
         s.push(' ');
         s.push_str(tone_suffix);
     }
-    let words: Vec<&str> = vocab.split([',', '\n', ';']).map(str::trim).filter(|w| !w.is_empty()).collect();
+    let words = crate::storage::vocab_words(vocab);
     if !words.is_empty() {
         s.push_str(&format!(" Spell these words exactly like this when they occur: {}.", words.join(", ")));
     }
@@ -869,6 +880,41 @@ mod local_tests {
         assert!(run_command_mode(&remote, "hello", "capitalize").unwrap_err().contains("must run locally"));
         assert!(summarize_meeting(&remote, "Alice: ship Friday.").unwrap_err().contains("must run locally"));
         assert!(summarize_meeting(&Settings::default(), "   ").unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn style_prompts_are_non_contradictory_and_use_vocab_words() {
+        let clean = system_prompt(Style::Clean, "Parakeet; Ollama\nKubernetes, listen-rs");
+        let tighten = system_prompt(Style::Tighten, "Parakeet; Ollama\nKubernetes, listen-rs");
+
+        // Style::Clean preserves strict wording rules.
+        assert!(clean.contains(STYLE_CLEAN));
+        assert!(clean.contains("Preserve every content word in order"));
+        assert!(clean.contains("Remove only fillers and immediately repeated words."));
+
+        // Style::Tighten allows tightening without contradictory Clean-only instructions.
+        assert!(tighten.contains(STYLE_TIGHTEN));
+        assert!(!tighten.contains("Preserve every content word in order"));
+        assert!(!tighten.contains("Remove only fillers and immediately repeated words."));
+        assert!(tighten.contains("tighten rambling phrasing without inventing new content words"));
+        assert!(tighten.contains("Preserve every fact, number, quantity, name, negation"));
+
+        // Both styles preserve calibration wording in assessment prompts.
+        assert!(ASSESS_CODING.contains("Calibration:"));
+        assert!(ASSESS_GENERAL.contains("Calibration:"));
+
+        // Semicolon-, comma-, and newline-delimited vocab is parsed via storage::vocab_words.
+        let expected_words = crate::storage::vocab_words("Parakeet; Ollama\nKubernetes, listen-rs");
+        let expected_clause = format!(
+            " Spell these words exactly like this when they occur: {}.",
+            expected_words.join(", ")
+        );
+        assert!(clean.contains(&expected_clause));
+        assert!(tighten.contains(&expected_clause));
+        assert_eq!(
+            expected_words,
+            vec!["Parakeet", "Ollama", "Kubernetes", "listen-rs"]
+        );
     }
 }
 

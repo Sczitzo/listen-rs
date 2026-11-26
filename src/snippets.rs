@@ -13,15 +13,41 @@ pub struct Snippet {
     pub expansion: String,
 }
 
+/// Detailed result of expanding spoken snippets in an utterance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnippetResult {
+    pub text: String,
+    pub matched: bool,
+    pub standalone: bool,
+}
+
+/// Returns `true` if two snippet triggers are equivalent after collapsing whitespace
+/// and Unicode case-folding to lowercase.
+pub fn triggers_equal(a: &str, b: &str) -> bool {
+    let mut ia = a.split_whitespace();
+    let mut ib = b.split_whitespace();
+    loop {
+        match (ia.next(), ib.next()) {
+            (Some(wa), Some(wb)) => {
+                if wa.to_lowercase() != wb.to_lowercase() {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Validates and normalizes a voice snippet definition.
 ///
-/// Trims leading/trailing whitespace from `trigger` and rejects empty triggers,
+/// Trims and collapses internal whitespace in `trigger` and rejects empty triggers,
 /// empty/whitespace-only expansions, NUL bytes, or values longer than [`MAX_SNIPPET_LEN`] chars.
 pub fn validate_snippet(trigger: &str, expansion: &str) -> Result<Snippet, String> {
     if trigger.contains('\0') || expansion.contains('\0') {
         return Err("Snippets cannot contain NUL bytes.".into());
     }
-    let trigger = trigger.trim();
+    let trigger = trigger.split_whitespace().collect::<Vec<_>>().join(" ");
     if trigger.is_empty() {
         return Err("Snippet trigger cannot be empty.".into());
     }
@@ -39,7 +65,7 @@ pub fn validate_snippet(trigger: &str, expansion: &str) -> Result<Snippet, Strin
         ));
     }
     Ok(Snippet {
-        trigger: trigger.to_owned(),
+        trigger,
         expansion: expansion.to_owned(),
     })
 }
@@ -96,21 +122,37 @@ fn compile_trigger_regex(trigger: &str) -> Option<Regex> {
     if parts.is_empty() {
         return None;
     }
-    let pattern = format!("(?i){}", parts.join(r"\s+"));
+    let pattern = format!("(?i){}", parts.join(r"(?:\s+|-)"));
     Regex::new(&pattern).ok()
 }
 
 /// Expands spoken snippet triggers inside `text` deterministically.
 ///
-/// - Matches triggers case-insensitively on whole-phrase boundaries.
+/// Returns `(expanded_text, did_expand)`. Call [`expand_snippets_detailed`] when you also
+/// need to know whether the entire utterance was a single standalone snippet trigger.
+pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
+    let res = expand_snippets_detailed(text, snippets);
+    (res.text, res.matched)
+}
+
+/// Expands spoken snippet triggers inside `text` deterministically, returning both whether
+/// any snippet matched and whether the entire utterance was a single standalone trigger.
+///
+/// - Matches triggers case-insensitively on whole-phrase boundaries (allowing whitespace or
+///   hyphens between multi-word trigger tokens).
 /// - Resolves overlapping triggers longest-first (tie-breaking by slice order).
 /// - Performs a single non-recursive pass so expansions never re-trigger snippets.
 /// - Strips automatic ASR trailing periods/commas on standalone triggers
-///   (e.g. `"my email."` -> `"cam@example.com"`), and preserves inline trailing punctuation
-///   unless the expansion is multiline or already ends with terminal punctuation.
-pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
+///   (e.g. `"my email."` or `"my email ."` -> `"cam@example.com"`), and preserves inline
+///   trailing punctuation unless the expansion is multiline or already ends with terminal
+///   punctuation.
+pub fn expand_snippets_detailed(text: &str, snippets: &[Snippet]) -> SnippetResult {
     if text.is_empty() || snippets.is_empty() {
-        return (text.to_owned(), false);
+        return SnippetResult {
+            text: text.to_owned(),
+            matched: false,
+            standalone: false,
+        };
     }
 
     // Collect valid snippets and sort longest trigger first (stable sort keeps original order on ties).
@@ -131,7 +173,11 @@ pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
         .collect();
 
     if ordered.is_empty() {
-        return (text.to_owned(), false);
+        return SnippetResult {
+            text: text.to_owned(),
+            matched: false,
+            standalone: false,
+        };
     }
 
     ordered.sort_by(|a, b| b.0.cmp(&a.0));
@@ -157,7 +203,11 @@ pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
     }
 
     if matches.is_empty() {
-        return (text.to_owned(), false);
+        return SnippetResult {
+            text: text.to_owned(),
+            matched: false,
+            standalone: false,
+        };
     }
 
     matches.sort_by_key(|&(start, _, _)| start);
@@ -179,10 +229,14 @@ pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
                 out.push_str(after);
             } else {
                 // Preserve any trailing whitespace after the stripped ASR period/comma.
-                let stripped = after.trim_start_matches(['.', ',']);
+                let stripped = after.trim_start().trim_start_matches(['.', ',']);
                 out.push_str(stripped);
             }
-            return (out, true);
+            return SnippetResult {
+                text: out,
+                matched: true,
+                standalone: true,
+            };
         }
         if before.trim().is_empty()
             && suppress_terminal
@@ -192,9 +246,13 @@ pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
             let mut out = String::with_capacity(before.len() + expansion.len());
             out.push_str(before);
             out.push_str(expansion);
-            let stripped = after.trim_start_matches(is_terminal_punct);
+            let stripped = after.trim_start().trim_start_matches(is_terminal_punct);
             out.push_str(stripped);
-            return (out, true);
+            return SnippetResult {
+                text: out,
+                matched: true,
+                standalone: true,
+            };
         }
     }
 
@@ -217,17 +275,29 @@ pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> (String, bool) {
         let mut next_cursor = end;
         if suppress_terminal {
             let rest = &text[end..];
-            let punct_bytes: usize = rest
+            let ws_bytes: usize = rest
+                .chars()
+                .take_while(|&c| matches!(c, ' ' | '\t'))
+                .map(char::len_utf8)
+                .sum();
+            let after_ws = &rest[ws_bytes..];
+            let punct_bytes: usize = after_ws
                 .chars()
                 .take_while(|&c| is_terminal_punct(c))
                 .map(char::len_utf8)
                 .sum();
-            next_cursor += punct_bytes;
+            if punct_bytes > 0 {
+                next_cursor += ws_bytes + punct_bytes;
+            }
         }
         cursor = next_cursor;
     }
     out.push_str(&text[cursor..]);
-    (out, true)
+    SnippetResult {
+        text: out,
+        matched: true,
+        standalone: false,
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +473,98 @@ mod tests {
         assert_eq!(
             expand_snippets("Use c++17 here.", &snippets),
             ("Use c++17 here.".into(), false)
+        );
+    }
+
+    #[test]
+    fn punctuation_hyphenation_dedup_and_standalone_flag() {
+        let snippets = vec![
+            snippet("my email", "cam@example.com"),
+            snippet("my sig", "Best regards,\nCam"),
+            snippet("follow up", "follow-up action item"),
+            snippet("greet", "hello"),
+            snippet("full greeting", "hello world"),
+            snippet("zoom link", "https://zoom.us/j/12345"),
+        ];
+
+        // Space before trailing punctuation on standalone triggers strips space + punctuation cleanly.
+        let email_res = expand_snippets_detailed("my email .", &snippets);
+        assert_eq!(
+            email_res,
+            SnippetResult {
+                text: "cam@example.com".into(),
+                matched: true,
+                standalone: true,
+            }
+        );
+        let sig_res = expand_snippets_detailed("my sig !", &snippets);
+        assert_eq!(
+            sig_res,
+            SnippetResult {
+                text: "Best regards,\nCam".into(),
+                matched: true,
+                standalone: true,
+            }
+        );
+        // Trailing whitespace after stripped punctuation is still preserved.
+        assert_eq!(
+            expand_snippets("my email . ", &snippets),
+            ("cam@example.com ".into(), true)
+        );
+        assert_eq!(
+            expand_snippets("my sig ! ", &snippets),
+            ("Best regards,\nCam ".into(), true)
+        );
+
+        // Hyphenated spoken trigger matches multi-word trigger.
+        let follow_res = expand_snippets_detailed("Send a follow-up tomorrow.", &snippets);
+        assert_eq!(
+            follow_res,
+            SnippetResult {
+                text: "Send a follow-up action item tomorrow.".into(),
+                matched: true,
+                standalone: false,
+            }
+        );
+
+        // Internal whitespace normalized in validate_snippet and triggers_equal handles whitespace + Unicode case.
+        let s = validate_snippet("my  \t email", "cam@example.com").unwrap();
+        assert_eq!(s.trigger, "my email");
+        assert!(triggers_equal("my  email", "my email"));
+        assert!(triggers_equal("  my\temail  ", "MY EMAIL"));
+        assert!(triggers_equal("CAFÉ", "café"));
+        assert!(!triggers_equal("my email", "my other email"));
+
+        // Non-standalone utterance whose expanded text happens to equal another snippet's expansion
+        // MUST report standalone == false (avoiding false AI-cleanup skip).
+        let collision_res = expand_snippets_detailed("greet world", &snippets);
+        assert_eq!(
+            collision_res,
+            SnippetResult {
+                text: "hello world".into(),
+                matched: true,
+                standalone: false,
+            }
+        );
+
+        // Inline multiline and URL snippets expand with standalone == false (staying post-Ollama).
+        let inline_sig = expand_snippets_detailed("Thanks for the update. my sig !", &snippets);
+        assert_eq!(
+            inline_sig,
+            SnippetResult {
+                text: "Thanks for the update. Best regards,\nCam".into(),
+                matched: true,
+                standalone: false,
+            }
+        );
+        let inline_url = expand_snippets_detailed("Join via zoom link now.", &snippets);
+        assert_eq!(
+            inline_url,
+            SnippetResult {
+                text: "Join via https://zoom.us/j/12345 now.".into(),
+                matched: true,
+                standalone: false,
+            }
         );
     }
 }
