@@ -1694,32 +1694,78 @@ impl ListenApp {
         let mut actions = Vec::new();
         match self.settings.layout {
             LayoutId::Desk => {
+                let win_w = ctx.screen_rect().width();
+                let nav = desk_nav_metrics(win_w);
                 egui::TopBottomPanel::top("rail")
                     .exact_height(RAIL_H)
                     .show_separator_line(false)
-                    .frame(Frame::default().fill(p.nav).inner_margin(Margin::symmetric(24, 0)))
+                    .frame(Frame::default().fill(p.nav).inner_margin(Margin::symmetric(nav.pad_x, 0)))
                     .show(ctx, |ui| {
                         let rect = ui.max_rect();
+                        let pad = f32::from(nav.pad_x);
                         ui.painter().line_segment(
-                            [pos2(rect.left() - 24.0, rect.bottom()), pos2(rect.right() + 24.0, rect.bottom())],
+                            [pos2(rect.left() - pad, rect.bottom()), pos2(rect.right() + pad, rect.bottom())],
                             Stroke::new(1.0_f32, p.line),
                         );
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui::widgets::brand_mark(ui, p, 30.0);
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("Listen").font(FontId::new(19.0, FontFamily::Name("humanist".into()))).strong().color(p.fg));
-                            ui.add_space(16.0);
-                            for pg in Page::ALL {
-                                if nav_pill(ui, p, pg.label(), self.page == pg, false).clicked() {
-                                    actions.push(UiAction::GoPage(pg));
-                                }
+                        // Claim Quit on the right FIRST so nav pills can never overlap it at any width or zoom.
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if nav_pill_sized(ui, p, "Quit", false, false, nav.font_size, nav.btn_pad_x)
+                                .on_hover_text("Quit Listen completely")
+                                .clicked()
+                            {
+                                actions.push(UiAction::RequestQuit);
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if nav_pill(ui, p, "Quit", false, false).on_hover_text("Quit Listen completely").clicked() {
-                                    actions.push(UiAction::RequestQuit);
-                                }
-                            });
+                            ui.add_space(8.0);
+                            let left_w = ui.available_width().max(120.0);
+                            ui.allocate_ui_with_layout(
+                                vec2(left_w, RAIL_H),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.set_max_width(left_w);
+                                    egui::ScrollArea::horizontal()
+                                        .id_salt("desk_nav_scroll")
+                                        .auto_shrink([false, false])
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                                        )
+                                        .show(ui, |ui| {
+                                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                                ui.spacing_mut().item_spacing.x = nav.item_gap;
+                                                ui::widgets::brand_mark(ui, p, nav.mark_size);
+                                                if nav.show_wordmark {
+                                                    ui.add_space(4.0);
+                                                    ui.label(
+                                                        RichText::new("Listen")
+                                                            .font(FontId::new(19.0, FontFamily::Name("humanist".into())))
+                                                            .strong()
+                                                            .color(p.fg),
+                                                    );
+                                                }
+                                                ui.add_space(nav.brand_gap);
+                                                for pg in Page::ALL {
+                                                    let lbl = if nav.short_lab && pg == Page::Lab {
+                                                        "Lab"
+                                                    } else {
+                                                        pg.label()
+                                                    };
+                                                    if nav_pill_sized(
+                                                        ui,
+                                                        p,
+                                                        lbl,
+                                                        self.page == pg,
+                                                        false,
+                                                        nav.font_size,
+                                                        nav.btn_pad_x,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::GoPage(pg));
+                                                    }
+                                                }
+                                            });
+                                        });
+                                },
+                            );
                         });
                     });
                 self.render_central(ctx, p, 920.0, Margin::symmetric(28, 20), &mut actions);
@@ -1760,26 +1806,53 @@ impl ListenApp {
                 egui::TopBottomPanel::top("compact-rail")
                     .exact_height(54.0)
                     .show_separator_line(false)
-                    .frame(Frame::default().fill(p.nav).inner_margin(Margin::symmetric(12, 0)))
+                    .frame(Frame::default().fill(p.nav).inner_margin(Margin::symmetric(10, 0)))
                     .show(ctx, |ui| {
                         let rect = ui.max_rect();
                         ui.painter().line_segment(
-                            [pos2(rect.left() - 12.0, rect.bottom()), pos2(rect.right() + 12.0, rect.bottom())],
+                            [pos2(rect.left() - 10.0, rect.bottom()), pos2(rect.right() + 10.0, rect.bottom())],
                             Stroke::new(1.0_f32, p.line),
                         );
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            ui::widgets::brand_mark(ui, p, 26.0);
-                            ui.add_space(4.0);
-                            for pg in Page::ALL {
-                                let short = match pg {
-                                    Page::Lab => "Lab",
-                                    _ => pg.label(),
-                                };
-                                if nav_pill(ui, p, short, self.page == pg, false).clicked() {
-                                    actions.push(UiAction::GoPage(pg));
-                                }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if nav_pill_sized(ui, p, "Quit", false, false, 12.5, 6.0)
+                                .on_hover_text("Quit Listen completely")
+                                .clicked()
+                            {
+                                actions.push(UiAction::RequestQuit);
                             }
+                            ui.add_space(6.0);
+                            let left_w = ui.available_width().max(120.0);
+                            ui.allocate_ui_with_layout(
+                                vec2(left_w, 54.0),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.set_max_width(left_w);
+                                    egui::ScrollArea::horizontal()
+                                        .id_salt("compact_nav_scroll")
+                                        .auto_shrink([false, false])
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                                        )
+                                        .show(ui, |ui| {
+                                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                ui::widgets::brand_mark(ui, p, 24.0);
+                                                ui.add_space(4.0);
+                                                for pg in Page::ALL {
+                                                    let short = match pg {
+                                                        Page::Lab => "Lab",
+                                                        _ => pg.label(),
+                                                    };
+                                                    if nav_pill_sized(ui, p, short, self.page == pg, false, 12.5, 6.0)
+                                                        .clicked()
+                                                    {
+                                                        actions.push(UiAction::GoPage(pg));
+                                                    }
+                                                }
+                                            });
+                                        });
+                                },
+                            );
                         });
                     });
                 self.render_central(ctx, p, 480.0, Margin::symmetric(16, 16), &mut actions);
@@ -2228,17 +2301,82 @@ impl eframe::App for ListenApp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DeskNavMetrics {
+    pad_x: i8,
+    mark_size: f32,
+    show_wordmark: bool,
+    brand_gap: f32,
+    item_gap: f32,
+    short_lab: bool,
+    font_size: f32,
+    btn_pad_x: f32,
+}
+
+fn desk_nav_metrics(win_w: f32) -> DeskNavMetrics {
+    if win_w >= 680.0 {
+        DeskNavMetrics {
+            pad_x: 24,
+            mark_size: 30.0,
+            show_wordmark: true,
+            brand_gap: 16.0,
+            item_gap: 6.0,
+            short_lab: false,
+            font_size: 13.5,
+            btn_pad_x: 10.0,
+        }
+    } else if win_w >= 560.0 {
+        DeskNavMetrics {
+            pad_x: 14,
+            mark_size: 28.0,
+            show_wordmark: false,
+            brand_gap: 8.0,
+            item_gap: 4.0,
+            short_lab: win_w < 610.0,
+            font_size: 13.0,
+            btn_pad_x: 8.0,
+        }
+    } else {
+        DeskNavMetrics {
+            pad_x: 10,
+            mark_size: 24.0,
+            show_wordmark: false,
+            brand_gap: 4.0,
+            item_gap: 3.0,
+            short_lab: true,
+            font_size: 12.5,
+            btn_pad_x: 6.0,
+        }
+    }
+}
+
 fn nav_pill(ui: &mut Ui, p: &Palette, label: &str, active: bool, full_width: bool) -> egui::Response {
+    nav_pill_sized(ui, p, label, active, full_width, 13.5, 10.0)
+}
+
+fn nav_pill_sized(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &str,
+    active: bool,
+    full_width: bool,
+    font_size: f32,
+    pad_x: f32,
+) -> egui::Response {
     let fill = if active { blend(p.surface, p.accent, 0.14) } else { Color32::TRANSPARENT };
     let stroke = if active { Stroke::new(1.0_f32, p.accent.gamma_multiply(0.75)) } else { Stroke::NONE };
     let fg = if active { p.fg } else { p.muted };
     let min_w = if full_width { ui.available_width() } else { 0.0 };
-    let b = egui::Button::new(RichText::new(label).size(13.5).color(fg))
+    let prev_pad = ui.spacing().button_padding;
+    ui.spacing_mut().button_padding = vec2(pad_x, 6.0);
+    let b = egui::Button::new(RichText::new(label).size(font_size).color(fg))
         .fill(fill)
         .stroke(stroke)
         .corner_radius(CornerRadius::same(8))
         .min_size(vec2(min_w, 32.0));
-    ui.add(b).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let resp = ui.add(b).on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.spacing_mut().button_padding = prev_pad;
+    resp
 }
 
 fn parse_assessment_view(val: &Value) -> Option<LabAssessmentView> {
@@ -2425,8 +2563,8 @@ fn should_hide_on_close(has_tray: bool, preview: bool) -> bool {
 #[cfg(test)]
 mod close_policy_tests {
     use super::{
-        delete_favorite_with, parse_assessment_view, save_favorite_with, should_hide_on_close,
-        sync_meeting_ui_from_core, upsert_favorite,
+        delete_favorite_with, desk_nav_metrics, parse_assessment_view, save_favorite_with,
+        should_hide_on_close, sync_meeting_ui_from_core, upsert_favorite,
     };
     use crate::engine::{Core, UiEvent};
     use crate::storage::{Favorite, Settings};
@@ -2439,6 +2577,23 @@ mod close_policy_tests {
         assert!(!should_hide_on_close(false, false));
         assert!(!should_hide_on_close(true, true));
         assert!(!should_hide_on_close(false, true));
+    }
+
+    #[test]
+    fn desk_nav_metrics_compacts_cleanly_at_narrow_widths() {
+        let wide = desk_nav_metrics(920.0);
+        assert!(wide.show_wordmark);
+        assert!(!wide.short_lab);
+
+        let mid = desk_nav_metrics(620.0);
+        assert!(!mid.show_wordmark);
+        assert!(!mid.short_lab);
+
+        let narrow = desk_nav_metrics(480.0);
+        assert!(!narrow.show_wordmark);
+        assert!(narrow.short_lab);
+        assert!(narrow.pad_x < wide.pad_x);
+        assert!(narrow.btn_pad_x < wide.btn_pad_x);
     }
 
     #[test]
